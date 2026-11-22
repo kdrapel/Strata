@@ -3317,6 +3317,45 @@ __global__ void __launch_bounds__(256) k_unembed_softcap(
     }
 }
 
+// Single-row S6_K unembed for the 2304-wide Inkling trunk. Cache the entire
+// FP16 input in LDS so all eight output waves can finish without tile barriers.
+constexpr int kS6DecodeHidden = 2304;
+__global__ void __launch_bounds__(256) k_unembed_s6_decode(
+    const uint8_t* __restrict__ unemb_raw,
+    const float* __restrict__ hidden,
+    float* __restrict__ logits,
+    int vocab, float softcap) {
+    constexpr int superblocks = kS6DecodeHidden / 256;
+    constexpr int block_bytes = 198;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int v = blockIdx.x * 8 + (tid >> 5);
+
+    __shared__ alignas(16) half_t input[kS6DecodeHidden];
+    for (int i = tid; i < kS6DecodeHidden; i += 256) {
+        input[i] = static_cast<half_t>(hidden[i]);
+    }
+    __syncthreads();
+    if (v >= vocab) return;
+
+    const int j = lane * 8;
+    const uint8_t* row = unemb_raw + static_cast<size_t>(v) * superblocks * block_bytes;
+    float acc = 0.0f;
+    for (int s = 0; s < superblocks; ++s) {
+        const uint8_t* block = row + s * block_bytes;
+        const float scale = decode_sk_sub_eff_i8(block, CODE_S6_K, j >> 6);
+        const uint4 w = decode_sk_8_unscaled_f16(block + 6, CODE_S6_K, j);
+        const uint4 x = *reinterpret_cast<const uint4*>(&input[s * 256 + j]);
+        float dot = fdot2_f32(w.x, x.x, 0.0f);
+        dot = fdot2_f32(w.y, x.y, dot);
+        dot = fdot2_f32(w.z, x.z, dot);
+        dot = fdot2_f32(w.w, x.w, dot);
+        acc = fmaf(dot, scale, acc);
+    }
+    const float z = wave32_sum(acc);
+    if (lane == 0) logits[v] = softcap * tanhf(z * (1.0f / softcap));
+}
+
 // Multi-format DSpark combined unembed argmax stage 1: computes dot(unemb[v], combined) for all V, deterministic first-max!
 // Uses LDS-cached FP16 combined vector + fast 32-bit S_K unpack + fdot2_f32 for 3x faster Markov drafting!
 __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(

@@ -27,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -486,6 +487,12 @@ public:
         }
         max_slots_ = std::max(1, std::min(kMaxParallelSlots, opts.parallel));
         max_ctx_ = std::max(256, opts.max_ctx);
+        const char* s6_decode = std::getenv("STRATA_INKLING_HIP_S6_DECODE");
+        const std::string_view arch(mem_info_.arch_name);
+        const bool gfx1200 = arch == "gfx1200" || arch.starts_with("gfx1200:");
+        use_s6_decode_ = gfx1200 && s6_decode && std::strcmp(s6_decode, "1") == 0;
+        const char* q8_projections = std::getenv("STRATA_INKLING_HIP_Q8_PROJECTIONS");
+        const bool use_q8_projections = gfx1200 && q8_projections && std::strcmp(q8_projections, "1") == 0;
 
         // Initialize dynamic hipBLASLt Tensile runner (RDNA3/3.5/4; cleanly falls back on RDNA2 or missing DLL/SO)
         (void)blaslt_.init(mem_info_.is_uma, mem_info_.gen);
@@ -521,6 +528,7 @@ public:
 
         const std::string embed_k = "model.llm.embed.weight";
         const std::string unemb_k = "model.llm.unembed.weight";
+        size_t q8_unpack_bytes = 0;
 
         for (const auto& kv : model.m.trunk) {
             const std::string& name = kv.first;
@@ -531,6 +539,15 @@ public:
                 if (!upload_raw(pt.buf, sec1.data() + ti.off, ti.bytes, err)) return false;
                 packed_trunk_[name] = pt;
             } else if (is_large_2d_matmul(name, ti)) {
+                if (use_q8_projections && ti.fmt == F_Q8ROW && (ti.cols() & 3) == 0 &&
+                    (name.ends_with(".attn.wq_du.weight") || name.ends_with(".attn.gate_attn.weight") ||
+                     name.ends_with(".attn.wo_ud.weight"))) {
+                    auto& packed = trunk_q8_projections_[name];
+                    packed.info = ti;
+                    if (!upload_raw(packed.buf, sec1.data() + ti.off, ti.bytes, err)) return false;
+                    q8_unpack_bytes = std::max(q8_unpack_bytes, static_cast<size_t>(ti.numel()) * sizeof(uint16_t));
+                    continue;
+                }
                 auto f32 = decode_sec1_f32(sec1.data(), ti);
                 auto bf16 = f32_vec_to_bf16(f32);
                 GpuBuffer b;
@@ -555,6 +572,8 @@ public:
                 }
             }
         }
+        if (q8_unpack_bytes && !hip_ok(alloc_gpu_buffer(d_q8_unpack_, q8_unpack_bytes, mem_info_.is_uma),
+                                      "packed projection BF16 scratch", err)) return false;
 
         // Precompute stacked cross-pass msg_queries [4, D] per core layer -> upload to GPU
         {
@@ -2172,6 +2191,19 @@ private:
         auto it_bf = trunk_bf16_.find(key);
         if (it_bf != trunk_bf16_.end()) {
             launch_bf16_opt(reinterpret_cast<const uint16_t*>(it_bf->second.dev_ptr), X, nullptr, Y, M, N, K);
+        } else if (auto it_q8 = trunk_q8_projections_.find(key); it_q8 != trunk_q8_projections_.end()) {
+            const auto& packed = it_q8->second;
+            const float* scales = reinterpret_cast<const float*>(packed.buf.dev_ptr);
+            const int8_t* weights = reinterpret_cast<const int8_t*>(scales + packed.info.rows());
+            if (M == 1) {
+                launch_q8row_linear(weights, scales, X, Y, M, N, K, stream_);
+            } else {
+                const int cols4 = K / 4;
+                k_unpack_q8row_bf16<<<(N * cols4 + 255) / 256, 256, 0, stream_>>>(
+                    reinterpret_cast<const uint32_t*>(weights), scales,
+                    reinterpret_cast<uint2*>(d_q8_unpack_.dev_ptr), N, cols4);
+                launch_bf16_opt(reinterpret_cast<const uint16_t*>(d_q8_unpack_.dev_ptr), X, nullptr, Y, M, N, K);
+            }
         } else {
             launch_f32_linear(reinterpret_cast<const float*>(trunk_f32_.at(key).dev_ptr), X, nullptr, Y, M, N, K, stream_, mem_info_.gen);
         }
@@ -2193,6 +2225,8 @@ private:
         size_t tot = expert_gpu_arena_.bytes + d_exp_stage_.bytes + d_exp_w13_f16_.bytes + d_exp_w2_f16_.bytes;
         tot += hybrid_.allocated_bytes();
         for (const auto& b : trunk_qkvrg_) tot += b.bytes;
+        tot += d_q8_unpack_.bytes;
+        for (const auto& kv : trunk_q8_projections_) tot += kv.second.buf.bytes;
         for (const auto& kv : trunk_bf16_) tot += kv.second.bytes;
         for (const auto& kv : trunk_f32_) tot += kv.second.bytes;
         for (const auto& kv : packed_trunk_) tot += kv.second.buf.bytes;
@@ -2359,6 +2393,22 @@ private:
         }
         vision_.loaded = true;
         return true;
+    }
+
+    void launch_unembed(const float* hidden, int batch_size, int n_want) {
+        const auto& weights = packed_trunk_.at("model.llm.unembed.weight");
+        const int vocab = c_.vocab_unpadded;
+        float* logits = reinterpret_cast<float*>(sc_logits_.dev_ptr);
+        if (use_s6_decode_ && batch_size == 1 && c_.hidden == kS6DecodeHidden &&
+            weights.info.fmt == CODE_S6_K) {
+            k_unembed_s6_decode<<<(vocab + 7) / 8, 256, 0, stream_>>>(
+                weights.buf.dev_ptr, hidden, logits, vocab, c_.logit_softcap);
+            return;
+        }
+        k_unembed_softcap<<<dim3((vocab + 7) / 8, (n_want + 15) / 16), 256, 0, stream_>>>(
+            weights.buf.dev_ptr, weights.info.fmt, static_cast<int>(weights.info.rows()),
+            hidden, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
+            logits, n_want, vocab, c_.hidden, c_.logit_softcap);
     }
 
     bool forward_batch_chunk(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) {
@@ -3622,11 +3672,7 @@ private:
                 launch_dspark_ctx_kernels(B);
             }
             const int V = c_.vocab_unpadded;
-            const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
-            k_unembed_softcap<<<dim3((V + 7) / 8, (B + 15) / 16), 256, 0, stream_>>>(
-                unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
-                h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
-                reinterpret_cast<float*>(sc_logits_.dev_ptr), B, V, D, c_.logit_softcap);
+            launch_unembed(h_norm, B, B);
 
             hipGraph_t g = nullptr;
             if (!hip_ok(hipStreamEndCapture(stream_, &g), "hipStreamEndCapture", err)) return false;
@@ -3691,12 +3737,8 @@ private:
                     if (!hip_ok(alloc_gpu_buffer(sc_logits_, lbytes, mem_info_.is_uma), "logits buf", err)) return false;
                 }
                 (void)hipMemcpyAsync(sc_want_idx_.dev_ptr, want_idx.data(), n_want * 4, hipMemcpyHostToDevice, stream_);
-                const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
                 if (prof_on) (void)hipEventRecord(pev[9], stream_);
-                k_unembed_softcap<<<dim3((V + 7) / 8, (n_want + 15) / 16), 256, 0, stream_>>>(
-                    unemb_pk.buf.dev_ptr, unemb_pk.info.fmt, static_cast<int>(unemb_pk.info.rows()),
-                    h_norm, reinterpret_cast<const int32_t*>(sc_want_idx_.dev_ptr),
-                    reinterpret_cast<float*>(sc_logits_.dev_ptr), n_want, V, D, c_.logit_softcap);
+                launch_unembed(h_norm, B, n_want);
                 if (prof_on) (void)hipEventRecord(pev[10], stream_);
                 if (!hip_ok(hipMemcpyAsync(logits_out, sc_logits_.dev_ptr, lbytes, hipMemcpyDeviceToHost, stream_),
                             "logits D2H", err)) return false;
@@ -4447,6 +4489,9 @@ private:
         free_gpu_buffer(d_sconv_attn_all_); free_gpu_buffer(d_sconv_mlp_all_);
         for (auto& b : trunk_qkvrg_) free_gpu_buffer(b);
         trunk_qkvrg_.clear();
+        free_gpu_buffer(d_q8_unpack_);
+        for (auto& kv : trunk_q8_projections_) free_gpu_buffer(kv.second.buf);
+        trunk_q8_projections_.clear();
         for (auto& kv : trunk_bf16_) free_gpu_buffer(kv.second);
         for (auto& kv : trunk_f32_) free_gpu_buffer(kv.second);
         for (auto& kv : packed_trunk_) free_gpu_buffer(kv.second.buf);
@@ -4523,12 +4568,15 @@ private:
     int blaslt_min_m_ = 16;
     int blaslt_moe_min_b_ = 999999;
     bool use_i8_moe_wmma_ = true;
+    bool use_s6_decode_ = false;
     KvDtype default_kv_dtype_ = KvDtype::FP16;
     bool has_dspark_ = false;
     int max_slots_ = 1;
     int max_ctx_ = 32768;
 
     std::vector<GpuBuffer> trunk_qkvrg_;
+    std::unordered_map<std::string, GpuPackedTensor> trunk_q8_projections_;
+    GpuBuffer d_q8_unpack_;
     std::unordered_map<std::string, GpuBuffer> trunk_bf16_;
     std::unordered_map<std::string, GpuBuffer> trunk_f32_;
     std::unordered_map<std::string, GpuPackedTensor> packed_trunk_;

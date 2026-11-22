@@ -2436,6 +2436,21 @@ __global__ void __launch_bounds__(256) k_q8row_gemv(
     }
 }
 
+// Expand a packed projection into the reusable BF16 buffer for batched GEMM.
+__global__ void __launch_bounds__(256) k_unpack_q8row_bf16(
+    const uint32_t* __restrict__ weights, const float* __restrict__ scales,
+    uint2* __restrict__ output, int rows, int cols4) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * cols4) return;
+    const float scale = scales[i / cols4];
+    const uint32_t q = weights[i];
+    const uint32_t a = f32_to_bf16(static_cast<float>(static_cast<int8_t>(q)) * scale);
+    const uint32_t b = f32_to_bf16(static_cast<float>(static_cast<int8_t>(q >> 8)) * scale);
+    const uint32_t c = f32_to_bf16(static_cast<float>(static_cast<int8_t>(q >> 16)) * scale);
+    const uint32_t d = f32_to_bf16(static_cast<float>(static_cast<int8_t>(q >> 24)) * scale);
+    output[i] = make_uint2(a | (b << 16), c | (d << 16));
+}
+
 // Fused interleaved Gate+Up -> SITU(4.0, 25.0) activation (FP32 -> FP16 for w2 input)
 __global__ void __launch_bounds__(256) k_situ_interleaved(
     const float* __restrict__ gu,   // [M, 2*inter] (even=gate, odd=up)

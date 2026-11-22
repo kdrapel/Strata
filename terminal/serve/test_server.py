@@ -4933,6 +4933,15 @@ class ThinkingBudget(unittest.TestCase):
         self.assertIn("answering: 10 of max 6400 tokens", lines[1])
         self.assertIn("thinking: 10 of max 6400 tokens", lines[2])
 
+    def test_progress_shows_generation_before_the_parser_emits_output(self):
+        st = {"phase": "reading the prompt", "first_token": None,
+              "started": time.time(), "max_tokens": 31262}
+        self.svc._note(1, [], st=st)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.svc._progress(0, st=st)
+        self.assertIn("generating: 1 of max 31262 tokens", out.getvalue())
+
     def test_a_budget_above_max_tokens_is_capped_to_leave_room_for_the_answer(self):
         """#984: max_tokens 300 and a budget of 5000 never fired: the reply ended while still thinking.  The thinking
         is closed at max_tokens less the answer's reserve (max 512 or a quarter, at most half), with one log line."""
