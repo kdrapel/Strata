@@ -1181,7 +1181,14 @@ public:
                 k_half_rope<<<dim3(KV, B), hd / 2, 0, stream_>>>(kd, nullptr, anchor_pos, B, KV, hd, dspark_cfg_.rope_theta);
             }
 
-            const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : 0;
+            // Opt-in: STRATA_INKLING_HIP_DSPARK_WINDOW=N caps the drafter's *global* layers to the last N
+            // positions. Its sliding layers keep the window the model asks for, so this can only remove work;
+            // 0 (the default) leaves the drafter exactly as configured, so the default path is unchanged.
+            static const int ds_swa_env = [] {
+                const char* e = std::getenv("STRATA_INKLING_HIP_DSPARK_WINDOW");
+                return e ? std::atoi(e) : 0;
+            }();
+            const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : (ds_swa_env > 0 ? ds_swa_env : 0);
             k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B), 128, 0, stream_>>>(
                 q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                 reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
@@ -1437,7 +1444,11 @@ public:
                     k_dspark_split_qkv_norm_rope<<<dim3(H + 2 * KV, B_ds), 128, 0, stream_>>>(
                         qkv_cat, ds_f32(p + ".self_attn.q_norm.weight"), ds_f32(p + ".self_attn.k_norm.weight"),
                         d_hdr, q, kd, vd, B_ds, H, KV, hd, dspark_cfg_.rms_eps, dspark_cfg_.rope_theta);
-                    const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : 0;
+                    static const int ds_swa_env = [] {
+                        const char* e = std::getenv("STRATA_INKLING_HIP_DSPARK_WINDOW");
+                        return e ? std::atoi(e) : 0;
+                    }();
+                    const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : (ds_swa_env > 0 ? ds_swa_env : 0);
                     k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B_ds), 128, 0, stream_>>>(
                         q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                         reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
@@ -3930,6 +3941,11 @@ private:
     // Exact 48-Visit Tree Verify + On-GPU Greedy Argmax (100% HIP-Graphable per tree size M=2..12!)
     bool forward_tree_verify(int B, int slot, uint64_t kv_gen_sum, std::string& err) {
         if (B < 1 || B > 12) return false;
+        static const bool tree_fp8_enabled = [] {
+            const char* value = std::getenv("STRATA_INKLING_HIP_TREE_FP8");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const bool use_tree_fp8 = tree_fp8_enabled && mem_info_.gen == AmdGen::Rdna4;
         const int tprof_lvl = (std::getenv("STRATA_HIP_TREE_PROF") ? std::atoi(std::getenv("STRATA_HIP_TREE_PROF")) : 0);
         const bool tprof_detail = (tprof_lvl >= 2);
         hipGraphExec_t& g_exec = graph_tree_verify_exec_[B];
@@ -4251,12 +4267,21 @@ private:
             VisitKvPool& kvp = is_swa ? swa_pools_[kv_slot] : glob_pools_[kv_slot];
             const int swa_w = is_swa ? c_.swa_win : 0;
             if (is_fp8) {
-                k3_flash_swa_gqa_tree<true><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
-                    q, gatea, rbias, sinks, d_tm, pos_dev,
-                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
-                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
-                    reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
-                    tk_v, tv_v, aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                const auto launch_fp8 = [&]<bool Native, bool GlobalPages>() {
+                    k3_flash_swa_gqa_tree<true, Native, GlobalPages><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                        q, gatea, rbias, sinks, d_tm, pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        tk_v, tv_v, aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                };
+                if (use_tree_fp8 && !is_swa) {
+                    launch_fp8.template operator()<true, true>();
+                } else if (use_tree_fp8) {
+                    launch_fp8.template operator()<true, false>();
+                } else {
+                    launch_fp8.template operator()<false, false>();
+                }
             } else {
                 k3_flash_swa_gqa_tree<false><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
                     q, gatea, rbias, sinks, d_tm, pos_dev,

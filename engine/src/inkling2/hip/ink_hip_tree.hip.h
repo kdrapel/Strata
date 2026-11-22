@@ -611,7 +611,7 @@ __global__ void __launch_bounds__(128) k2_qrkv_treestore_relpos_fused(
 
 // 4-Wave Split-KV Exact Tree Flash-SWA / Flash-GQA Attention (Prefix Paged KV + Bitmask Tree Ancestors!)
 // Grid: (n_q_heads, M), Block: 128
-template <bool FP8_KV>
+template <bool FP8_KV, bool NATIVE_FP8 = false, bool GLOBAL_PAGES = false>
 __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
     const float* __restrict__ Q,            // [M, n_q_heads, 128]
     const float* __restrict__ gate_attn,    // nullptr or [M, n_q_heads, 128]
@@ -654,11 +654,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
     const float* rb_row = rel_bias ? (rel_bias + (static_cast<size_t>(m) * n_q_heads + qh) * max_rel) : nullptr;
     const int32_t* pt_row = page_table + slot * max_pages_per_slot;
 
-    // 1. Attend to committed prefix [k_start, base_pos - 1] across all 4 waves
-    for (int kp = k_start + wave; kp < base_pos; kp += 4) {
-        const int ring_p = (swa_window > 0) ? (kp % swa_window) : kp;
-        const int phys = pt_row[ring_p >> 6];
-        const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
+    const auto attend_prefix = [&](int kp, size_t tok_base) {
         const size_t base = tok_base * elems + kv_off;
 
         float k0, k1, k2, k3, v0, v1, v2, v3;
@@ -667,14 +663,33 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
             const float vs = v_scales ? v_scales[tok_base] : 1.0f;
             const uint32_t kw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(k_pool) + base);
             const uint32_t vw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(v_pool) + base);
-            k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
-            k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
-            k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
-            k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
-            v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
-            v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
-            v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
-            v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
+#if INK_GFX12 && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
+            if constexpr (NATIVE_FP8) {
+                const auto k_lo = __builtin_amdgcn_cvt_pk_f32_fp8(kw, false);
+                const auto k_hi = __builtin_amdgcn_cvt_pk_f32_fp8(kw, true);
+                const auto v_lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw, false);
+                const auto v_hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw, true);
+                // Match the software decoder's treatment of both NaN encodings.
+                k0 = (__builtin_isnan(k_lo[0]) ? 0.0f : k_lo[0]) * ks;
+                k1 = (__builtin_isnan(k_lo[1]) ? 0.0f : k_lo[1]) * ks;
+                k2 = (__builtin_isnan(k_hi[0]) ? 0.0f : k_hi[0]) * ks;
+                k3 = (__builtin_isnan(k_hi[1]) ? 0.0f : k_hi[1]) * ks;
+                v0 = (__builtin_isnan(v_lo[0]) ? 0.0f : v_lo[0]) * vs;
+                v1 = (__builtin_isnan(v_lo[1]) ? 0.0f : v_lo[1]) * vs;
+                v2 = (__builtin_isnan(v_hi[0]) ? 0.0f : v_hi[0]) * vs;
+                v3 = (__builtin_isnan(v_hi[1]) ? 0.0f : v_hi[1]) * vs;
+            } else
+#endif
+            {
+                k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
+                k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
+                k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
+                k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
+                v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
+                v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
+                v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
+                v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
+            }
         } else {
             const uint2 kw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(k_pool) + base);
             const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
@@ -693,6 +708,23 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
         o2 = fmaf(o2, alpha, beta * v2); o3 = fmaf(o3, alpha, beta * v3);
         sum_exp = fmaf(sum_exp, alpha, beta);
         max_l = new_max;
+    };
+
+    // Keep each wave's position order, but resolve the page table only once per page.
+    // The ring for sliding-window layers may wrap within a logical page.
+    if constexpr (GLOBAL_PAGES) {
+        for (int page_start = 0; page_start < base_pos; page_start += 64) {
+            const size_t token = static_cast<size_t>(pt_row[page_start >> 6]) * 64;
+            const int end = min(64, base_pos - page_start);
+            for (int offset = wave; offset < end; offset += 4) {
+                attend_prefix(page_start + offset, token + offset);
+            }
+        }
+    } else {
+        for (int kp = k_start + wave; kp < base_pos; kp += 4) {
+            const int ring = swa_window > 0 ? kp % swa_window : kp;
+            attend_prefix(kp, static_cast<size_t>(pt_row[ring >> 6]) * 64 + (ring & 63));
+        }
     }
 
     // 2. Wave 0 attends to bitmask-selected tree ancestors j in [0..M-1] (L2-resident!)

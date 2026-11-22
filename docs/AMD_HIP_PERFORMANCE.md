@@ -1,4 +1,46 @@
-# RX 7900 XTX support and performance evidence
+# AMD HIP performance
+
+## Quick start on the RX 9060 XT
+
+Use an Inkling HIP build that includes the FP8 tree verifier and an
+`Inkling-2-Mini-SQ-15.strata` model file. The example runs from the checkout root on
+Windows with the local `gfx1200` build. Replace the model path with yours.
+
+```powershell
+$env:STRATA_INKLING_HIP_S6_DECODE = '1'
+$env:STRATA_INKLING_HIP_Q8_PROJECTIONS = '1'
+$env:STRATA_INKLING_HIP_Q8_VECTOR_DECODE = '1'
+$env:STRATA_INKLING_HIP_FP8_GQA_DECODE = '1'
+$env:STRATA_INKLING_HIP_DSPARK_WINDOW = '1024'
+$env:STRATA_INKLING_HIP_TREE_FP8 = '1'
+
+.\build-hip\src\inkling2\strata-inkling.exe --serve --native 'D:\models\Inkling-2-Mini-SQ-15.strata' --max-context 32768 --kv fp8 --draft on
+```
+
+`--kv fp8` selects the cache format used by the FP8 attention paths. `--draft on`
+enables DSpark, and the 1,024-token window limits the drafter's global attention.
+The target model still verifies against its full configured context. `--serve`
+starts the engine's standard input/output protocol. See [AMD HIP build instructions](AMD_HIP.md).
+
+### RX 9060 XT benchmark
+
+Measured on Windows with the RX 9060 XT (16 GB, `gfx1200`), TheRock 7.14.1 and
+Inkling-2-Mini SQ-15. Both benchmark arms used the same executable and settings.
+The baseline had the earlier optimizations and capped DSpark enabled. The new
+version also enabled `STRATA_INKLING_HIP_TREE_FP8=1`.
+
+| Metric at 32K prompt tokens | Baseline | New verifier | Change |
+| --- | ---: | ---: | ---: |
+| Decode with HIP graph replay | 29.74 tok/s | 35.59 tok/s | **+19.7%** |
+| Verifier attention over matched cycles | 1,583 ms | 1,130 ms | **−28.6%** |
+
+The decode comparison used two runs per setting in baseline/new/new/baseline
+order. All four runs emitted the same 128 greedy tokens. The attention timings
+came from a separate profiling run series with graph replay disabled, matching
+16 verification cycles by context position and batch size. These figures cover
+one prompt and GPU.
+
+## RX 7900 XTX support and performance evidence
 
 This opt-in Linux `gfx1100` backend supersedes the initial support in
 [PR #94](https://github.com/Niko1221/Strata/pull/94). It retains HIP runtime and
@@ -8,7 +50,7 @@ and the host-memory / SSD paths used by the measured configuration. HIP blocking
 expert uploads use one reusable pinned staging buffer, including prompt-cache
 refills, to avoid repeated pageable-source registrations.
 
-## Reproduce the configuration
+### Reproduce the configuration
 
 Build instructions are in [AMD_HIP.md](AMD_HIP.md). The numbers
 below were measured on a build with llama.cpp's MMQ kernels (Strata 0.2.15 and earlier; that build option was
@@ -65,7 +107,7 @@ unbuffered log to contain exactly one completed timing record per request. The
 128-token output cap is intentional for throughput measurement, not task success.
 Never use cancelled-request timing lines as throughput evidence.
 
-## Final revision benchmark
+### Final revision benchmark
 
 Measured on 2026-09-29, source revision `9568e78da663e6b224ab96d57baf450717b36e73`.
 HIP executable SHA-256: `705f5925a788bc227bad72abfb5466032e0879d752fea9afc3eb32051b35182b`.
@@ -105,7 +147,7 @@ Zero KV reuse is not equivalent to a cold filesystem cache. First-use speed
 and warmed speed are reported separately. Individual observations do not
 establish confidence intervals or a general rate at every context length.
 
-## Correctness and quality limits
+### Correctness and quality limits
 
 Both HIP and CUDA executables built from the measured source revision. CUDA was
 compile-checked, not performance-tested by this run. The selected HIP CTest suite
@@ -131,7 +173,7 @@ end-to-end vision validation, Windows HIP, other AMD architectures, or mixed
 AMD/NVIDIA execution. Existing CUDA multi-GPU code remains present but is not
 validation of HIP multi-GPU support.
 
-## Attribution and rejected experiments
+### Attribution and rejected experiments
 
 The measurements above were taken before this backend was rebased onto engine 0.1.24. The PR's own batched
 embedding gather and QSA indexer append (adapted from
