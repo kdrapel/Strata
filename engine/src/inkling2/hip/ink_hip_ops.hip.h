@@ -2036,33 +2036,157 @@ __global__ void __launch_bounds__(256) k3_flash_splitkv_part(
     }
 }
 
-// Stage 2: Merges KSPLITS partials + applies sigmoid(gate_attn) (< 5 us!)
+constexpr int kGlobalGqaSplits = 16;
+constexpr int kGlobalGqaStride = 132;
+
+__device__ __forceinline__ int fp8_gqa_splits(int length, int window) {
+    if (window > 0) return length >= 512 ? 8 : 4;
+    return length > 4096 ? kGlobalGqaSplits : 4;
+}
+
+// FP8 decode. Reuse each KV load across three query heads while
+// maintaining a separate online softmax state for each head.
+__global__ void __launch_bounds__(256) k3_flash_gqa_fp8_part(
+    const float* __restrict__ Q, const float* __restrict__ rel_bias,
+    const float* __restrict__ sink_logits, const int32_t* __restrict__ slots,
+    const int32_t* __restrict__ pos, const int32_t* __restrict__ page_table,
+    int max_pages_per_slot, const uint8_t* __restrict__ k_pool,
+    const uint8_t* __restrict__ v_pool, const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales, float* __restrict__ partials,
+    int n_kv_heads, int max_rel, int window) {
+    constexpr int group = 3;
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int kvh = blockIdx.x;
+    const int split = blockIdx.z;
+    const int cur = pos[0];
+    const int available = cur + 1;
+    const int length = window > 0 ? min(available, window) : available;
+    const int splits = fp8_gqa_splits(length, window);
+    if (split >= splits) return;
+    const int chunk = (length + splits - 1) / splits;
+    const int start = available - length + split * chunk;
+    const int end = min(available, start + chunk);
+    const int d0 = lane * 4;
+    const int32_t* pages = page_table + slots[0] * max_pages_per_slot;
+    const float qscale = rsqrtf(128.0f);
+
+    float4 q[group], out[group];
+    float max_l[group], sum[group];
+#pragma unroll
+    for (int h = 0; h < group; ++h) {
+        const int qh = kvh * group + h;
+        const float4 v = *reinterpret_cast<const float4*>(Q + qh * 128 + d0);
+        q[h] = make_float4(v.x * qscale, v.y * qscale, v.z * qscale, v.w * qscale);
+        out[h] = make_float4(0, 0, 0, 0);
+        const bool sink = split == 0 && wave == 0 && sink_logits;
+        max_l[h] = sink ? sink_logits[qh] : -1e30f;
+        sum[h] = sink ? 1.0f : 0.0f;
+    }
+    auto load = [](const uint8_t* pool, size_t idx, float scale) {
+        const uint32_t w = *reinterpret_cast<const uint32_t*>(pool + idx);
+#if INK_GFX12 && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
+        const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(w, false);
+        const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(w, true);
+        // Match the software decoder's zero result for the two NaN encodings.
+        return make_float4((__builtin_isnan(lo[0]) ? 0.0f : lo[0]) * scale,
+                           (__builtin_isnan(lo[1]) ? 0.0f : lo[1]) * scale,
+                           (__builtin_isnan(hi[0]) ? 0.0f : hi[0]) * scale,
+                           (__builtin_isnan(hi[1]) ? 0.0f : hi[1]) * scale);
+#else
+        return make_float4(e4m3fn_to_f32(static_cast<uint8_t>(w)) * scale,
+                           e4m3fn_to_f32(static_cast<uint8_t>(w >> 8)) * scale,
+                           e4m3fn_to_f32(static_cast<uint8_t>(w >> 16)) * scale,
+                           e4m3fn_to_f32(static_cast<uint8_t>(w >> 24)) * scale);
+#endif
+    };
+    for (int p = start + wave; p < end; p += 8) {
+        const int ring = window > 0 ? p % window : p;
+        const size_t token = static_cast<size_t>(pages[ring >> 6]) * 64 + (ring & 63);
+        const size_t idx = (token * n_kv_heads + kvh) * 128 + d0;
+        const float4 k = load(k_pool, idx, k_scales[token]);
+        const float4 v = load(v_pool, idx, v_scales[token]);
+        const int dist = cur - p;
+#pragma unroll
+        for (int h = 0; h < group; ++h) {
+            const float4 a = q[h];
+            float score = wave32_sum(fmaf(a.x, k.x, fmaf(a.y, k.y, fmaf(a.z, k.z, a.w * k.w))));
+            if (rel_bias && dist < max_rel) score += rel_bias[(kvh * group + h) * max_rel + dist];
+            const float m = fmaxf(max_l[h], score);
+            const float alpha = __expf(max_l[h] - m), beta = __expf(score - m);
+            out[h].x = fmaf(out[h].x, alpha, beta * v.x);
+            out[h].y = fmaf(out[h].y, alpha, beta * v.y);
+            out[h].z = fmaf(out[h].z, alpha, beta * v.z);
+            out[h].w = fmaf(out[h].w, alpha, beta * v.w);
+            sum[h] = fmaf(sum[h], alpha, beta);
+            max_l[h] = m;
+        }
+    }
+
+    __shared__ float s_max[group][8], s_sum[group][8];
+    __shared__ alignas(16) float4 s_out[group][8][32];
+#pragma unroll
+    for (int h = 0; h < group; ++h) {
+        if (lane == 0) { s_max[h][wave] = max_l[h]; s_sum[h][wave] = sum[h]; }
+        s_out[h][wave][lane] = out[h];
+    }
+    __syncthreads();
+    if (wave >= group) return;
+    const int h = wave;
+    float maximum = -1e30f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) maximum = fmaxf(maximum, s_max[h][w]);
+    float total = 0.0f;
+    float4 acc = make_float4(0, 0, 0, 0);
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        if (s_sum[h][w] > 0.0f) {
+            const float weight = __expf(s_max[h][w] - maximum);
+            total += weight * s_sum[h][w];
+            const float4 v = s_out[h][w][lane];
+            acc.x = fmaf(weight, v.x, acc.x);
+            acc.y = fmaf(weight, v.y, acc.y);
+            acc.z = fmaf(weight, v.z, acc.z);
+            acc.w = fmaf(weight, v.w, acc.w);
+        }
+    }
+    float* dst = partials + ((kvh * group + h) * kGlobalGqaSplits + split) * kGlobalGqaStride;
+    *reinterpret_cast<float4*>(dst + d0) = acc;
+    if (lane == 0) { dst[128] = maximum; dst[129] = total; }
+}
+
+// Stage 2: Merge split-KV partials and apply sigmoid(gate_attn).
 // Grid = (n_q_heads, M), Block = 32 (1 wave = 128 dims!)
-template <int KSPLITS = 4>
+template <int KSPLITS = 4, int STRIDE = 130>
 __global__ void __launch_bounds__(32) k3_flash_splitkv_reduce(
     const float* __restrict__ partials,
     const float* __restrict__ gate_attn,
     float* __restrict__ O_out,
-    int M, int n_q_heads) {
+    int M, int n_q_heads, const int32_t* pos = nullptr, int window = 0) {
     const int lane = threadIdx.x & 31;
     const int qh = blockIdx.x;
     const int m = blockIdx.y;
     if (qh >= n_q_heads || m >= M) return;
     const int d0 = lane * 4;
-    const float* base = partials + (static_cast<size_t>(m) * n_q_heads + qh) * KSPLITS * 130;
+    const float* base = partials + (static_cast<size_t>(m) * n_q_heads + qh) * KSPLITS * STRIDE;
+    int splits = KSPLITS;
+    if constexpr (KSPLITS == kGlobalGqaSplits && STRIDE == kGlobalGqaStride) {
+        const int available = pos[m] + 1;
+        splits = fp8_gqa_splits(window > 0 ? min(available, window) : available, window);
+    }
 
     float gmax = -1e30f;
 #pragma unroll
-    for (int s = 0; s < KSPLITS; ++s) gmax = fmaxf(gmax, base[s * 130 + 128]);
+    for (int s = 0; s < splits; ++s) gmax = fmaxf(gmax, base[s * STRIDE + 128]);
     float tot_s = 0.0f;
     float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
 #pragma unroll
-    for (int s = 0; s < KSPLITS; ++s) {
-        const float ls = base[s * 130 + 129];
+    for (int s = 0; s < splits; ++s) {
+        const float ls = base[s * STRIDE + 129];
         if (ls > 0.0f) {
-            const float wt = __expf(base[s * 130 + 128] - gmax);
+            const float wt = __expf(base[s * STRIDE + 128] - gmax);
             tot_s += wt * ls;
-            const float4 p = *reinterpret_cast<const float4*>(base + s * 130 + d0);
+            const float4 p = *reinterpret_cast<const float4*>(base + s * STRIDE + d0);
             r0 = fmaf(wt, p.x, r0); r1 = fmaf(wt, p.y, r1);
             r2 = fmaf(wt, p.z, r2); r3 = fmaf(wt, p.w, r3);
         }

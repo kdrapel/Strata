@@ -493,6 +493,11 @@ public:
         use_s6_decode_ = gfx1200 && s6_decode && std::strcmp(s6_decode, "1") == 0;
         const char* q8_projections = std::getenv("STRATA_INKLING_HIP_Q8_PROJECTIONS");
         const bool use_q8_projections = gfx1200 && q8_projections && std::strcmp(q8_projections, "1") == 0;
+        const char* q8_vector = std::getenv("STRATA_INKLING_HIP_Q8_VECTOR_DECODE");
+        use_q8_vector_decode_ = use_q8_projections && q8_vector && std::strcmp(q8_vector, "1") == 0;
+        const char* fp8_gqa = std::getenv("STRATA_INKLING_HIP_FP8_GQA_DECODE");
+        use_fp8_gqa_decode_ = gfx1200 && fp8_gqa && std::strcmp(fp8_gqa, "1") == 0 &&
+                              c_.head_dim == 128 && c_.n_head == 3 * c_.n_kv;
 
         // Initialize dynamic hipBLASLt Tensile runner (RDNA3/3.5/4; cleanly falls back on RDNA2 or missing DLL/SO)
         (void)blaslt_.init(mem_info_.is_uma, mem_info_.gen);
@@ -2187,6 +2192,16 @@ private:
         }
     }
 
+    Q8RowMatrix q8_vector_matrix(const std::string& key, int rows, int cols) const {
+        if (!use_q8_vector_decode_ || (cols & 15) != 0) return {};
+        auto it = trunk_q8_projections_.find(key);
+        if (it == trunk_q8_projections_.end()) return {};
+        const auto& packed = it->second;
+        if (packed.info.cols() != cols || packed.info.rows() < rows || (packed.info.rows() & 3) != 0) return {};
+        const float* scales = reinterpret_cast<const float*>(packed.buf.dev_ptr);
+        return {reinterpret_cast<const uint4*>(scales + packed.info.rows()), scales};
+    }
+
     void launch_trunk_linear(const std::string& key, const float* X, float* Y, int M, int N, int K) {
         auto it_bf = trunk_bf16_.find(key);
         if (it_bf != trunk_bf16_.end()) {
@@ -2196,7 +2211,13 @@ private:
             const float* scales = reinterpret_cast<const float*>(packed.buf.dev_ptr);
             const int8_t* weights = reinterpret_cast<const int8_t*>(scales + packed.info.rows());
             if (M == 1) {
-                launch_q8row_linear(weights, scales, X, Y, M, N, K, stream_);
+                const auto vec = q8_vector_matrix(key, N, K);
+                if (vec.weights) {
+                    k_q8row_gemv1_vec<<<(N + 7) / 8, 256, 0, stream_>>>(
+                        vec, Q8RowMatrix{}, reinterpret_cast<const float4*>(X), Y, nullptr, N, K);
+                } else {
+                    launch_q8row_linear(weights, scales, X, Y, M, N, K, stream_);
+                }
             } else {
                 const int cols4 = K / 4;
                 k_unpack_q8row_bf16<<<(N * cols4 + 255) / 256, 256, 0, stream_>>>(
@@ -2271,7 +2292,9 @@ private:
             !re(sc_sinks_, static_cast<size_t>(B) * c_.n_head * 4) || !re(sc_gate_a_, static_cast<size_t>(B) * q_dim * 4) ||
             !re(sc_k_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) || !re(sc_v_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) ||
             !re(sc_attn_out_, static_cast<size_t>(B) * q_dim * 4) ||
-            !re(sc_splitkv_part_, static_cast<size_t>(std::max(B, 4)) * c_.n_head * 4 * 130 * 4) ||
+            !re(sc_splitkv_part_, static_cast<size_t>(c_.n_head) * sizeof(float) *
+                                  std::max(std::max(B, 4) * 4 * 130,
+                                           use_fp8_gqa_decode_ ? kGlobalGqaSplits * kGlobalGqaStride : 0)) ||
             !re(sc_o_proj_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_a_sconv_, static_cast<size_t>(B) * D * 4) || !re(sc_mlp_in_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_mlp_f16_, static_cast<size_t>(B) * D * sizeof(half_t)) ||
@@ -2924,11 +2947,20 @@ private:
                     launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n + kv_dim) * D, v_in, nullptr, v_raw, B, kv_dim, D);
                 }
             } else {
-                launch_trunk_linear(p + ".attn.wq_du.weight", q_in, q,     B, q_dim, D);
+                const std::string q_key = p + ".attn.wq_du.weight";
+                const std::string gate_key = p + ".attn.gate_attn.weight";
+                const auto q8_q = B == 1 ? q8_vector_matrix(q_key, q_dim, D) : Q8RowMatrix{};
+                const auto q8_gate = q8_q.weights ? q8_vector_matrix(gate_key, q_dim, D) : Q8RowMatrix{};
+                if (q8_gate.weights) {
+                    k_q8row_gemv1_vec<<<dim3((q_dim + 7) / 8, 2), 256, 0, stream_>>>(
+                        q8_q, q8_gate, reinterpret_cast<const float4*>(q_in), q, gatea, q_dim, D);
+                } else {
+                    launch_trunk_linear(q_key, q_in, q, B, q_dim, D);
+                }
                 launch_trunk_linear(p + ".attn.wk_dv.weight", k_in, k_raw, B, kv_dim, D);
                 launch_trunk_linear(p + ".attn.wv_dv.weight", v_in, v_raw, B, kv_dim, D);
                 launch_trunk_linear(p + ".attn.wr_du.weight", q_in, r_raw, B, r_dim, D);
-                launch_trunk_linear(p + ".attn.gate_attn.weight", q_in, gatea, B, q_dim, D);
+                if (!q8_gate.weights) launch_trunk_linear(gate_key, q_in, gatea, B, q_dim, D);
             }
             if (!sink_done) {
                 launch_trunk_linear(p + ".attn.attn_sink_proj.weight", q_in, sinks, B, c_.n_head, D);
@@ -3024,6 +3056,17 @@ private:
                         kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
                         aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
                 }
+            } else if (B == 1 && is_fp8 && use_fp8_gqa_decode_) {
+                float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
+                const int blocks = swa_w > 0 ? 8 : kGlobalGqaSplits;
+                k3_flash_gqa_fp8_part<<<dim3(c_.n_kv, 1, blocks), 256, 0, stream_>>>(
+                    q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                    reinterpret_cast<const float*>(kvp.k_scales.dev_ptr),
+                    reinterpret_cast<const float*>(kvp.v_scales.dev_ptr), sp_part, c_.n_kv, c_.rel_extent, swa_w);
+                k3_flash_splitkv_reduce<kGlobalGqaSplits, kGlobalGqaStride><<<c_.n_head, 32, 0, stream_>>>(
+                    sp_part, gatea, aout, B, c_.n_head, pos_dev, swa_w);
             } else if (B <= 4) {
                 // 2-Stage FlashDecoding Split-KV (96 blocks x 8 waves = 768 waves at B=1 -> saturates ALL CUs!)
                 float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
@@ -3076,7 +3119,9 @@ private:
             // O-proj + post-attention ShortConv + AttnRes block boundary rule (1-launch super-fused at B=1 distinct-slot!)
             pmark(4);
             const std::string wo_key = p + ".attn.wo_ud.weight";
-            if (B == 1 && all_distinct_slots && rec_slot < 0 && q_dim <= 4096 && (q_dim & 7) == 0 && trunk_bf16_.count(wo_key) > 0) {
+            const auto q8_wo = B == 1 ? q8_vector_matrix(wo_key, D, q_dim) : Q8RowMatrix{};
+            if (B == 1 && all_distinct_slots && rec_slot < 0 &&
+                (q8_wo.weights || (q_dim <= 4096 && (q_dim & 7) == 0 && trunk_bf16_.count(wo_key) > 0))) {
                 const size_t vstride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(D) * sizeof(uint16_t);
                 float* bsave = nullptr;
                 if (ip % c_.block_size == 0) {
@@ -3084,12 +3129,16 @@ private:
                     blk_ptrs.push_back(bsave);
                     ++n_blocks;
                 }
-                k_bf16_gemv1_wo_sconv<<<(D + 7) / 8, 256, 0, stream_>>>(
-                    bf16_ptr(wo_key), aout,
-                    reinterpret_cast<const float*>(static_sconv_.at(p + ".attn_sconv").dev_ptr),
-                    reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr),
-                    reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr + visit * vstride),
-                    cur, bsave, D, q_dim);
+                const auto* static_w = reinterpret_cast<const float*>(static_sconv_.at(p + ".attn_sconv").dev_ptr);
+                const auto* slot_ids = reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr);
+                auto* history = reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr + visit * vstride);
+                if (q8_wo.weights) {
+                    k_q8row_gemv1_wo_sconv<<<(D + 7) / 8, 256, 0, stream_>>>(
+                        q8_wo, reinterpret_cast<const float4*>(aout), static_w, slot_ids, history, cur, bsave, D, q_dim);
+                } else {
+                    k_bf16_gemv1_wo_sconv<<<(D + 7) / 8, 256, 0, stream_>>>(
+                        bf16_ptr(wo_key), aout, static_w, slot_ids, history, cur, bsave, D, q_dim);
+                }
             } else {
                 launch_trunk_linear(wo_key, aout, oproj, B, D, q_dim);
                 if (ip % c_.block_size == 0) {
@@ -4569,6 +4618,8 @@ private:
     int blaslt_moe_min_b_ = 999999;
     bool use_i8_moe_wmma_ = true;
     bool use_s6_decode_ = false;
+    bool use_q8_vector_decode_ = false;
+    bool use_fp8_gqa_decode_ = false;
     KvDtype default_kv_dtype_ = KvDtype::FP16;
     bool has_dspark_ = false;
     int max_slots_ = 1;

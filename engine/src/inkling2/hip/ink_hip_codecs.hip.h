@@ -1476,6 +1476,77 @@ __global__ void __launch_bounds__(256) k_bf16_gemv1_qkvrg(
     }
 }
 
+struct Q8RowMatrix {
+    const uint4* weights = nullptr;
+    const float* scales = nullptr;
+};
+
+__device__ __forceinline__ float q8_word_dot(uint32_t w, float4 x, float acc) {
+    return fmaf(static_cast<float>(static_cast<int8_t>(w)), x.x,
+           fmaf(static_cast<float>(static_cast<int8_t>(w >> 8)), x.y,
+           fmaf(static_cast<float>(static_cast<int8_t>(w >> 16)), x.z,
+           fmaf(static_cast<float>(static_cast<int8_t>(w >> 24)), x.w, acc))));
+}
+
+// One wave per row, with 16-byte weight loads and independent FP32 accumulators.
+__device__ __forceinline__ float q8row_dot_vec(
+    Q8RowMatrix matrix, const float4* x, int row, int cols, int lane) {
+    const int tiles = cols / 16;
+    const uint4* w = matrix.weights + static_cast<size_t>(row) * tiles;
+    float a = 0.0f, b = 0.0f, c = 0.0f, d = 0.0f;
+    for (int t = lane; t < tiles; t += 32) {
+        const uint4 pack = w[t];
+        a = q8_word_dot(pack.x, x[t * 4], a);
+        b = q8_word_dot(pack.y, x[t * 4 + 1], b);
+        c = q8_word_dot(pack.z, x[t * 4 + 2], c);
+        d = q8_word_dot(pack.w, x[t * 4 + 3], d);
+    }
+    return wave32_sum((a + b) + (c + d)) * matrix.scales[row];
+}
+
+__global__ void __launch_bounds__(256) k_q8row_gemv1_vec(
+    Q8RowMatrix first, Q8RowMatrix second, const float4* __restrict__ x,
+    float* __restrict__ y_first, float* __restrict__ y_second, int rows, int cols) {
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const bool paired = blockIdx.y != 0;
+    const float sum = q8row_dot_vec(paired ? second : first, x, row, cols, lane);
+    if (lane == 0) (paired ? y_second : y_first)[row] = sum;
+}
+
+__device__ __forceinline__ void post_attn_sconv1(
+    float x, const float* weights, uint16_t* history, float* cur, float* saved, int row, int dim) {
+    const float h0 = bf16_to_f32(history[row]);
+    const float h1 = bf16_to_f32(history[dim + row]);
+    const float h2 = bf16_to_f32(history[2 * dim + row]);
+    const float4 w = reinterpret_cast<const float4*>(weights)[row];
+    const float y = (x + w.x * h0 + w.y * h1 + w.z * h2 + w.w * x) * 0.44721359549995793f;
+    history[row] = history[dim + row];
+    history[dim + row] = history[2 * dim + row];
+    history[2 * dim + row] = f32_to_bf16(x);
+    if (saved != nullptr) {
+        saved[row] = cur[row];
+        cur[row] = y;
+    } else {
+        cur[row] += y;
+    }
+}
+
+__global__ void __launch_bounds__(256) k_q8row_gemv1_wo_sconv(
+    Q8RowMatrix w, const float4* __restrict__ x,
+    const float* __restrict__ static_w, const int32_t* __restrict__ slot_ids,
+    uint16_t* __restrict__ hist_pool, float* __restrict__ cur,
+    float* __restrict__ blk_save, int dim, int cols) {
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= dim) return;
+    const float sum = q8row_dot_vec(w, x, row, cols, lane);
+    if (lane == 0) {
+        post_attn_sconv1(sum, static_w, hist_pool + static_cast<size_t>(slot_ids[0]) * 3 * dim,
+                         cur, blk_save, row, dim);
+    }
+}
+
 // Wave-6F Fused M=1 wo_ud BF16 GEMV + Post-Attn ShortConv4 + Residual Add / Block-Boundary Snapshot!
 // Deletes 48 sconv launches + 24 boundary D2D copies + 48 oproj/asc DRAM round-trips per token!
 // Grid: ((D + 7) / 8), Block: 256
@@ -1531,22 +1602,8 @@ __global__ void __launch_bounds__(256) k_bf16_gemv1_wo_sconv(
     }
     const float x0 = wave32_sum(acc0 + acc1);
     if (lane == 0) {
-        const int slot = slot_ids[0];
-        uint16_t* h_slot = hist_pool + static_cast<size_t>(slot) * 3 * D;
-        const float h0 = bf16_to_f32(h_slot[0 * D + row]);
-        const float h1 = bf16_to_f32(h_slot[1 * D + row]);
-        const float h2 = bf16_to_f32(h_slot[2 * D + row]);
-        const float4 sw = *reinterpret_cast<const float4*>(static_w + static_cast<size_t>(row) * 4);
-        const float y = (x0 + sw.x * h0 + sw.y * h1 + sw.z * h2 + sw.w * x0) * 0.44721359549995793f;
-        h_slot[0 * D + row] = h_slot[1 * D + row];
-        h_slot[1 * D + row] = h_slot[2 * D + row];
-        h_slot[2 * D + row] = f32_to_bf16(x0);
-        if (blk_save != nullptr) {
-            blk_save[row] = cur[row];
-            cur[row] = y;
-        } else {
-            cur[row] += y;
-        }
+        post_attn_sconv1(x0, static_w, hist_pool + static_cast<size_t>(slot_ids[0]) * 3 * D,
+                         cur, blk_save, row, D);
     }
 }
 
