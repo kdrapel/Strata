@@ -70,6 +70,7 @@ public:
 
     // Optional prompt-end conversation checkpoint (#6627): saves/restores SWA KV + ShortConv + DSpark state at `seq_len`
     // so multi-turn chats and exact repeats reuse the cached prompt even when hidden thinking or trailing tokens diverge.
+    virtual bool supports_prompt_checkpoint() const { return false; }
     virtual bool save_prompt_checkpoint(int slot, int seq_len) {
         (void)slot; (void)seq_len;
         return false;

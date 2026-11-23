@@ -2210,7 +2210,7 @@ __global__ void __launch_bounds__(32) k3_flash_splitkv_reduce(
 // Total LDS = 27.0 KB (< 32 KB -> 2 WG/CU!). Guarded #if INK_HAS_WMMA (zero WMMA emitted on RDNA2!).
 // Grid: (n_q_heads, (M + 63) / 64), Block: 128 (4 waves -> 16 Q rows per wave)
 // =================================================================================================
-template <bool FP8_KV>
+template <bool FP8_KV, bool FAST_FP8 = false>
 __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
     const float* __restrict__ Q,            // [M, n_q_heads, 128]
     const float* __restrict__ gate_attn,    // nullptr or [M, n_q_heads, 128]
@@ -2310,8 +2310,38 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
     const int k_begin = (swa_window > 0 && q_min_pos >= swa_window) ? (q_min_pos - swa_window + 1) : 0;
     const int k_blk_start = (k_begin / BK) * BK;
 
+    const auto unpack_fp8 = [](uint32_t packed, float scale) {
+#if INK_GFX12 && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
+        if constexpr (FAST_FP8) {
+            const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(packed, false);
+            const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(packed, true);
+            // The software decoder maps both E4M3FN NaN encodings to zero.
+            return make_float4((__builtin_isnan(lo[0]) ? 0.0f : lo[0]) * scale,
+                               (__builtin_isnan(lo[1]) ? 0.0f : lo[1]) * scale,
+                               (__builtin_isnan(hi[0]) ? 0.0f : hi[0]) * scale,
+                               (__builtin_isnan(hi[1]) ? 0.0f : hi[1]) * scale);
+        }
+#endif
+        return make_float4(e4m3fn_to_f32(static_cast<uint8_t>(packed)) * scale,
+                           e4m3fn_to_f32(static_cast<uint8_t>(packed >> 8)) * scale,
+                           e4m3fn_to_f32(static_cast<uint8_t>(packed >> 16)) * scale,
+                           e4m3fn_to_f32(static_cast<uint8_t>(packed >> 24)) * scale);
+    };
+
     // 3. Main FlashAttention-2 loop over KV blocks [kb .. kb + 63]
     for (int kb = k_blk_start; kb <= q_max_pos; kb += BK) {
+        // Each 64-token global tile is one KV page. A sliding-window tile can straddle the ring wrap.
+        size_t page_base = 0;
+        if constexpr (FAST_FP8) {
+            if (swa_window == 0) page_base = static_cast<size_t>(pt_row[kb >> 6]) * 64;
+        }
+        const auto kv_token = [&](int kp, int tile_row) {
+            if constexpr (FAST_FP8) {
+                if (swa_window == 0) return page_base + tile_row;
+            }
+            const int ring = (swa_window > 0) ? (kp % swa_window) : kp;
+            return static_cast<size_t>(pt_row[ring >> 6]) * 64 + (ring & 63);
+        };
         // 3A. Load K[64, 128] FP16 into kv.sK[64 * LDK]
         for (int idx = tid; idx < BK * (HD / 4); idx += 128) {
             const int r = idx >> 5;
@@ -2319,17 +2349,16 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
             const int kp = kb + r;
             half_t* dst = &kv.sK[r * LDK + c4 * 4];
             if (kp <= q_max_pos) {
-                const int ring_p = (swa_window > 0) ? (kp % swa_window) : kp;
-                const int phys = pt_row[ring_p >> 6];
-                const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
+                const size_t tok_base = kv_token(kp, r);
                 const size_t base = tok_base * elems + kv_off + c4 * 4;
                 if constexpr (FP8_KV) {
                     const float ks = k_scales ? k_scales[tok_base] : 1.0f;
                     const uint32_t kw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(k_pool) + base);
-                    dst[0] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks);
-                    dst[1] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks);
-                    dst[2] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks);
-                    dst[3] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks);
+                    const float4 decoded = unpack_fp8(kw, ks);
+                    dst[0] = static_cast<half_t>(decoded.x);
+                    dst[1] = static_cast<half_t>(decoded.y);
+                    dst[2] = static_cast<half_t>(decoded.z);
+                    dst[3] = static_cast<half_t>(decoded.w);
                 } else {
                     *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(k_pool) + base);
                 }
@@ -2421,17 +2450,16 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
             const int kp = kb + r;
             const int d0 = c4 * 4;
             if (kp <= q_max_pos) {
-                const int ring_p = (swa_window > 0) ? (kp % swa_window) : kp;
-                const int phys = pt_row[ring_p >> 6];
-                const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
+                const size_t tok_base = kv_token(kp, r);
                 const size_t base = tok_base * elems + kv_off + d0;
                 if constexpr (FP8_KV) {
                     const float vs = v_scales ? v_scales[tok_base] : 1.0f;
                     const uint32_t vw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(v_pool) + base);
-                    kv.sVt[(d0 + 0) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs);
-                    kv.sVt[(d0 + 1) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs);
-                    kv.sVt[(d0 + 2) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs);
-                    kv.sVt[(d0 + 3) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs);
+                    const float4 decoded = unpack_fp8(vw, vs);
+                    kv.sVt[(d0 + 0) * LDV + r] = static_cast<half_t>(decoded.x);
+                    kv.sVt[(d0 + 1) * LDV + r] = static_cast<half_t>(decoded.y);
+                    kv.sVt[(d0 + 2) * LDV + r] = static_cast<half_t>(decoded.z);
+                    kv.sVt[(d0 + 3) * LDV + r] = static_cast<half_t>(decoded.w);
                 } else {
                     const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
                     const hv2 v01 = __builtin_bit_cast(hv2, vw.x);

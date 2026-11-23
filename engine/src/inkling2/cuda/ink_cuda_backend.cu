@@ -289,9 +289,12 @@ public:
 
     // #6627: Save/restore slot's ShortConv (3.83 MB) + 40 SWA KV ring windows (<=160 MiB in host RAM) + DSpark SWA KV
     // so multi-turn chats and exact repeats reuse the full prior prompt even if hidden thinking or trailing tokens diverged!
+    bool supports_prompt_checkpoint() const override {
+        return initialized_ && !model_.ls_active && d_sconv_snap_ && max_slots_ <= 8;
+    }
+
     bool save_prompt_checkpoint(int slot, int seq_len) override {
-        if (!initialized_ || slot < 0 || slot >= max_slots_ || model_.ls_active || !d_sconv_snap_) return false;
-        if (seq_len <= 0 || max_slots_ > 8) return false;
+        if (!supports_prompt_checkpoint() || slot < 0 || slot >= max_slots_ || seq_len <= 0) return false;
         auto& ck = prompt_ckpts_[slot];
         ck.valid = false;
         ck.seq_len = seq_len;

@@ -342,6 +342,8 @@ public:
         slots_[slot].ckpt_valid = false;
     }
 
+    bool supports_prompt_checkpoint() const override { return true; }
+
     bool save_prompt_checkpoint(int slot, int seq_len) override {
         if (slot < 0 || slot >= static_cast<int>(slots_.size()) || !slots_[slot].allocated || seq_len <= 0) return false;
         auto& sl = slots_[slot];

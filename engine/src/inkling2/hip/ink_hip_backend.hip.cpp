@@ -227,6 +227,7 @@ struct VisitKvPool {
     bool is_fp8 = false;
     bool is_uma = false;
     bool host_offload = false;
+    bool allow_small_geometric_growth = false;
     int max_slots = 1;
     int max_pages_per_slot = 16;
     int kv_dim = 1024;
@@ -316,7 +317,11 @@ struct VisitKvPool {
             // Avoid 3x doubling OOM spike on tight-VRAM 16 GB discrete GPUs (#6613 / #6621):
             // step conservatively when free VRAM < 1.5 GiB or when doubling exceeds 70% of remaining VRAM.
             const size_t need_bytes = static_cast<size_t>(new_cap) * page_b * 2u;
-            if (vfree < (1536ULL << 20) || need_bytes > (vfree * 7u) / 10u) {
+            // Small single-slot FP8 pools can still grow geometrically when the whole new pool fits
+            // comfortably alongside the old one. Keep the tighter policy near VRAM exhaustion.
+            const bool small_growth = allow_small_geometric_growth && vfree >= (512ULL << 20) &&
+                                      need_bytes <= vfree / 8u;
+            if ((vfree < (1536ULL << 20) && !small_growth) || need_bytes > (vfree * 7u) / 10u) {
                 const int step = (vfree < (512ULL << 20)) ? 8 : 32;
                 new_cap = std::min(max_total_pages, std::max(min_pages, cap_pages + step));
             }
@@ -709,6 +714,8 @@ public:
         const char* q8_vector = std::getenv("STRATA_INKLING_HIP_Q8_VECTOR_DECODE");
         use_q8_vector_decode_ = use_q8_projections && q8_vector && std::strcmp(q8_vector, "1") == 0;
         const char* fp8_gqa = std::getenv("STRATA_INKLING_HIP_FP8_GQA_DECODE");
+        const char* fp8_prefill = std::getenv("STRATA_INKLING_HIP_FP8_PREFILL");
+        use_fp8_prefill_ = mem_info_.gen == AmdGen::Rdna4 && fp8_prefill && std::strcmp(fp8_prefill, "1") == 0;
         use_fp8_gqa_decode_ = gfx1200 && fp8_gqa && std::strcmp(fp8_gqa, "1") == 0 &&
                               c_.head_dim == 128 && c_.n_head == 3 * c_.n_kv;
 
@@ -739,6 +746,9 @@ public:
             (void)alloc_gpu_buffer(d_exp_w13_f16_, w13_b, mem_info_.is_uma);
             (void)alloc_gpu_buffer(d_exp_w2_f16_,  w2_b,  mem_info_.is_uma);
         }
+
+        const char* sf4_lut = std::getenv("STRATA_INKLING_HIP_MOE_SF4_LUT");
+        use_moe_sf4_lut_ = mem_info_.gen == AmdGen::Rdna4 && sf4_lut && std::strcmp(sf4_lut, "1") == 0;
 
         // 1. Load Section 1 trunk + DSpark arena (supports .strata v1.1, .gguf, and .safetensors!)
         std::vector<uint8_t> sec1;
@@ -1296,6 +1306,7 @@ public:
         layer_all_ep2_.assign(c_.n_phys, true);
         layer_gu_class_.assign(c_.n_phys, 3);
         layer_dn_class_.assign(c_.n_phys, 3);
+        layer_sk_sf4_.assign(c_.n_phys, false);
         for (int il = 0; il < c_.n_phys; ++il) {
             std::vector<GpuExpertDesc> tbl(c_.n_experts);
             std::vector<GpuExpertDesc> peer_tbl(ep2_active_ ? c_.n_experts : 0);
@@ -1334,6 +1345,12 @@ public:
             }
             layer_gu_class_[il] = all_gu_sk ? 0 : (all_gu_sf4 ? 1 : (all_gu_mx8 ? 2 : 3));
             layer_dn_class_[il] = all_dn_sk ? 0 : (all_dn_sf4 ? 1 : (all_dn_mx8 ? 2 : 3));
+            const auto is_sk = [](int code) { return (code >= CODE_S1_25 && code <= CODE_S6_K) || code == CODE_S8_K; };
+            layer_sk_sf4_[il] = use_moe_sf4_lut_ && layer_all_gpu_[il] && layer_gu_class_[il] == 3 && layer_dn_class_[il] == 3 &&
+                std::all_of(tbl.begin(), tbl.end(), [&](const GpuExpertDesc& expert) {
+                    return (expert.gu_code == CODE_SF4 && expert.dn_code == CODE_SF4) ||
+                           (is_sk(expert.gu_code) && is_sk(expert.dn_code));
+                });
             h_layer_exps_[il] = tbl;
             if (!upload_raw(d_layer_exps_[il], tbl.data(), tbl.size() * sizeof(GpuExpertDesc), err)) return false;
             if (ep2_active_) {
@@ -1406,8 +1423,12 @@ public:
             if (!swa_pools_[i].init(true, is_fp8, mem_info_.is_uma, max_slots_, max_swa_pages, kv_dim, err)) return false;
         }
         glob_pools_.resize(c_.n_global_visits);
-        for (int i = 0; i < c_.n_global_visits; ++i) {
-            if (!glob_pools_[i].init(false, is_fp8, mem_info_.is_uma, max_slots_, max_glob_pages, kv_dim, err)) return false;
+        const char* kv_growth = std::getenv("STRATA_INKLING_HIP_FAST_KV_GROW");
+        const bool small_growth = use_fp8_prefill_ && is_fp8 && max_slots_ == 1 &&
+                                  kv_growth && std::strcmp(kv_growth, "1") == 0;
+        for (auto& pool : glob_pools_) {
+            if (!pool.init(false, is_fp8, mem_info_.is_uma, max_slots_, max_glob_pages, kv_dim, err)) return false;
+            pool.allow_small_geometric_growth = small_growth;
         }
 
         const size_t kv_all_b = static_cast<size_t>(c_.n_visits) * max_slots_ * 3 * kv_dim * sizeof(uint16_t);
@@ -2924,9 +2945,9 @@ private:
                 const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, mt);
                 const dim3 g2((D + 127) / 128, c_.n_experts, mt);
                 if (B >= 64) {
-                    k_moe_grouped_w13_situ_wmma_128<<<g13, 256, 0, peer_stream_>>>(
+                    k_moe_grouped_w13_situ_wmma_128<><<<g13, 256, 0, peer_stream_>>>(
                         p_exps, p_off, p_btk, p_x, p_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
-                    k_moe_grouped_w2_wmma_128<<<g2, 256, 0, peer_stream_>>>(
+                    k_moe_grouped_w2_wmma_128<><<<g2, 256, 0, peer_stream_>>>(
                         p_exps, p_off, p_act, p_by, D, c_.inter);
                 } else {
                     k_moe_grouped_w13_situ_wmma<<<g13, 256, 0, peer_stream_>>>(
@@ -3770,12 +3791,16 @@ private:
                 // Wave32 WMMA FlashAttention-2 Prefill (BQ=64, BK=64, 27 KB LDS = 2 WG/CU, uint2 V + hoisted rel_bias skip!)
                 const dim3 fgrid(c_.n_head, (B + 63) / 64);
                 if (is_fp8) {
-                    k3_flash_swa_gqa_prefill_wmma<true><<<fgrid, 128, 0, stream_>>>(
-                        q, gatea, rbias, sinks, batch.slot_ids[0], batch.pos[0],
-                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
-                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
-                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
-                        aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                    const auto launch_fp8 = [&]<bool Fast>() {
+                        k3_flash_swa_gqa_prefill_wmma<true, Fast><<<fgrid, 128, 0, stream_>>>(
+                            q, gatea, rbias, sinks, batch.slot_ids[0], batch.pos[0],
+                            reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                            kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                            reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                            aout, B, c_.n_head, c_.n_kv, swa_w, c_.rel_extent);
+                    };
+                    if (use_fp8_prefill_) launch_fp8.template operator()<true>();
+                    else launch_fp8.template operator()<false>();
                 } else {
                     k3_flash_swa_gqa_prefill_wmma<false><<<fgrid, 128, 0, stream_>>>(
                         q, gatea, rbias, sinks, batch.slot_ids[0], batch.pos[0],
@@ -3961,9 +3986,9 @@ private:
                             const dim3 g13((2 * c_.inter + 127) / 128, c_.n_experts, mt);
                             const dim3 g2((D + 127) / 128, c_.n_experts, mt);
                             if (B >= 64) {
-                                k_moe_grouped_w13_situ_wmma_128<<<g13, 256, 0, stream_>>>(
+                                k_moe_grouped_w13_situ_wmma_128<><<<g13, 256, 0, stream_>>>(
                                     d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
-                                k_moe_grouped_w2_wmma_128<<<g2, 256, 0, stream_>>>(
+                                k_moe_grouped_w2_wmma_128<><<<g2, 256, 0, stream_>>>(
                                     d_exps, d_off, d_act, d_by, D, c_.inter);
                             } else {
                                 k_moe_grouped_w13_situ_wmma<<<g13, 256, 0, stream_>>>(
@@ -4107,8 +4132,11 @@ private:
                             } else if (layer_gu_class_[ip] == 2) {
                                 k_moe_grouped_w13_situ_wmma_128_spec<2><<<g13, 256, 0, stream_>>>(
                                     d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
+                            } else if (layer_sk_sf4_[ip]) {
+                                k_moe_grouped_w13_situ_wmma_128<true><<<g13, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
                             } else {
-                                k_moe_grouped_w13_situ_wmma_128<<<g13, 256, 0, stream_>>>(
+                                k_moe_grouped_w13_situ_wmma_128<><<<g13, 256, 0, stream_>>>(
                                     d_exps, d_off, d_btk, mlpf16, d_act, D, c_.inter, c_.situ_beta, c_.situ_lb);
                             }
                         }
@@ -4133,8 +4161,11 @@ private:
                             } else if (layer_dn_class_[ip] == 2) {
                                 k_moe_grouped_w2_wmma_128_spec<2><<<g2, 256, 0, stream_>>>(
                                     d_exps, d_off, d_act, d_by, D, c_.inter);
+                            } else if (layer_sk_sf4_[ip]) {
+                                k_moe_grouped_w2_wmma_128<true><<<g2, 256, 0, stream_>>>(
+                                    d_exps, d_off, d_act, d_by, D, c_.inter);
                             } else {
-                                k_moe_grouped_w2_wmma_128<<<g2, 256, 0, stream_>>>(
+                                k_moe_grouped_w2_wmma_128<><<<g2, 256, 0, stream_>>>(
                                     d_exps, d_off, d_act, d_by, D, c_.inter);
                             }
                         }
@@ -5547,9 +5578,11 @@ private:
     int blaslt_min_m_ = 16;
     int blaslt_moe_min_b_ = 999999;
     bool use_i8_moe_wmma_ = true;
+    bool use_moe_sf4_lut_ = false;
     bool use_s6_decode_ = false;
     bool use_q8_vector_decode_ = false;
     bool use_fp8_gqa_decode_ = false;
+    bool use_fp8_prefill_ = false;
     KvDtype default_kv_dtype_ = KvDtype::FP16;
     bool has_dspark_ = false;
     int max_slots_ = 1;
@@ -5591,6 +5624,7 @@ private:
     std::vector<bool> layer_all_gpu_;
     std::vector<uint8_t> layer_gu_class_;
     std::vector<uint8_t> layer_dn_class_;
+    std::vector<bool> layer_sk_sf4_;
     size_t vram_experts_loaded_ = 0;
     size_t ram_experts_loaded_ = 0;
 

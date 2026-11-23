@@ -13,14 +13,22 @@ $env:STRATA_INKLING_HIP_Q8_VECTOR_DECODE = '1'
 $env:STRATA_INKLING_HIP_FP8_GQA_DECODE = '1'
 $env:STRATA_INKLING_HIP_DSPARK_WINDOW = '1024'
 $env:STRATA_INKLING_HIP_TREE_FP8 = '1'
+$env:STRATA_INKLING_HIP_FP8_PREFILL = '1'
+$env:STRATA_INKLING_HIP_FAST_KV_GROW = '1'
+$env:STRATA_INKLING_HIP_MOE_SF4_LUT = '1'
 
 .\build-hip\src\inkling2\strata-inkling.exe --serve --native 'D:\models\Inkling-2-Mini-SQ-15.strata' --max-context 32768 --kv fp8 --draft on
 ```
 
 `--kv fp8` selects the cache format used by the FP8 attention paths. `--draft on`
 enables DSpark, and the 1,024-token window limits the drafter's global attention.
-The target model still verifies against its full configured context. `--serve`
-starts the engine's standard input/output protocol. See [AMD HIP build instructions](AMD_HIP.md).
+The target model still verifies against its full configured context.
+`STRATA_INKLING_HIP_FP8_PREFILL` uses native FP8 conversion while reading prompts
+on RDNA4. With it enabled, `STRATA_INKLING_HIP_FAST_KV_GROW` lets the engine grow
+small global KV caches in larger steps for a single request when there is enough
+VRAM. `STRATA_INKLING_HIP_MOE_SF4_LUT` reuses decoded SF4 weight values in the
+mixed-expert prefill kernels. `--serve` starts the engine's standard input/output protocol.
+See [AMD HIP build instructions](AMD_HIP.md).
 
 ### RX 9060 XT benchmark
 
@@ -39,6 +47,24 @@ order. All four runs emitted the same 128 greedy tokens. The attention timings
 came from a separate profiling run series with graph replay disabled, matching
 16 verification cycles by context position and batch size. These figures cover
 one prompt and GPU.
+
+### Prefill after the merge
+
+The HIP engine now reads the whole prompt in batches without a separate final
+token for an unsupported checkpoint. The quick-start settings also speed up
+FP8 attention and reduce reallocations of small global KV caches.
+
+On the same RX 9060 XT, the optimized build read the 32K prompt in **33.30 s**
+and generated at **41.95 tok/s**. The pre-merge build measured 37.03 s and
+34.59 tok/s. These are medians of two runs per build from separate same-day
+series, with the same 128 greedy tokens. In the four-run KV growth comparison,
+median prefill was 41.62 s with faster growth off and 33.30 s with it on.
+
+In a separate 32K test on the same card, the SF4 lookup table reduced median
+prefill from 43.50 s to 41.28 s. Prefill plus 128 generated tokens took 47.31 s
+with the lookup off and 45.21 s with it on. Each setting ran twice with graph
+replay enabled, in baseline/new/new/baseline order. All four runs emitted the
+same greedy tokens.
 
 ## RX 7900 XTX support and performance evidence
 

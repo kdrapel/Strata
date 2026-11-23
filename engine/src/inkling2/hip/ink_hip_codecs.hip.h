@@ -6278,6 +6278,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_sf4_i8_128(
 }
 
 // BM=128, BN=128, BK=32 FP16 WMMA Grouped-MoE w13 & w2 (21.5 KB LDS -> 2-3 WG/CU; handles MX8 + SF4 + S_K!)
+template <bool SF4_LOOKUP = false>
 __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
     const GpuExpertDesc* __restrict__ exps,
     const int32_t* __restrict__ exp_off,
@@ -6300,7 +6301,17 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
     __shared__ half_t s_e4m3[256];               //    512 B
     __shared__ int32_t sTok[BM];                 //    512 B -> 21.5 KB
 
+    __shared__ uint32_t sf4_pair[SF4_LOOKUP ? 256 : 1];
+    __shared__ uint32_t sf4_scale[SF4_LOOKUP ? 256 : 1];
     const int tid = threadIdx.x;
+    if constexpr (SF4_LOOKUP) {
+        if (desc.gu_code == CODE_SF4) {
+            const hv2 pair = {sf4_e2m1_f16(tid & 15u), sf4_e2m1_f16(tid >> 4)};
+            sf4_pair[tid] = __builtin_bit_cast(uint32_t, pair);
+            sf4_scale[tid] = h2_splat(e4m3fn_to_f32(static_cast<uint8_t>(tid)) * 0.0625f);
+            sync_lds();
+        }
+    }
     if (desc.gu_code == CODE_MX8) {
         s_e4m3[tid] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>(tid)));
         sync_lds();
@@ -6355,17 +6366,24 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
                 const int gb = (k0 >> 4) + b2;
                 half_t* dst = &sW[r * LD + b2 * 16];
                 if (gn < N) {
-                    const uint32_t sc2 = h2_splat(e4m3fn_to_f32(sf4_s[static_cast<size_t>(gn) * (D >> 4) + gb]) * 0.0625f);
+                    const uint8_t packed_scale = sf4_s[static_cast<size_t>(gn) * (D >> 4) + gb];
+                    const uint32_t sc2 = SF4_LOOKUP ? sf4_scale[packed_scale]
+                        : h2_splat(e4m3fn_to_f32(packed_scale) * 0.0625f);
                     const uint2 raw = *reinterpret_cast<const uint2*>(sf4_p + static_cast<size_t>(gn) * (D >> 1) + gb * 8);
                     uint32_t o0[4], o1[4];
 #pragma unroll
                     for (int i = 0; i < 4; ++i) {
                         const uint32_t b0 = (raw.x >> (i * 8)) & 0xFFu;
                         const uint32_t b1 = (raw.y >> (i * 8)) & 0xFFu;
-                        const hv2 h0 = {sf4_e2m1_f16(b0 & 15u), sf4_e2m1_f16(b0 >> 4)};
-                        const hv2 h1 = {sf4_e2m1_f16(b1 & 15u), sf4_e2m1_f16(b1 >> 4)};
-                        o0[i] = h2_mul(__builtin_bit_cast(uint32_t, h0), sc2);
-                        o1[i] = h2_mul(__builtin_bit_cast(uint32_t, h1), sc2);
+                        if constexpr (SF4_LOOKUP) {
+                            o0[i] = h2_mul(sf4_pair[b0], sc2);
+                            o1[i] = h2_mul(sf4_pair[b1], sc2);
+                        } else {
+                            const hv2 h0 = {sf4_e2m1_f16(b0 & 15u), sf4_e2m1_f16(b0 >> 4)};
+                            const hv2 h1 = {sf4_e2m1_f16(b1 & 15u), sf4_e2m1_f16(b1 >> 4)};
+                            o0[i] = h2_mul(__builtin_bit_cast(uint32_t, h0), sc2);
+                            o1[i] = h2_mul(__builtin_bit_cast(uint32_t, h1), sc2);
+                        }
                     }
                     *reinterpret_cast<uint4*>(dst)     = make_uint4(o0[0], o0[1], o0[2], o0[3]);
                     *reinterpret_cast<uint4*>(dst + 8) = make_uint4(o1[0], o1[1], o1[2], o1[3]);
@@ -6489,6 +6507,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
 #endif
 }
 
+template <bool SF4_LOOKUP = false>
 __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
     const GpuExpertDesc* __restrict__ exps,
     const int32_t* __restrict__ exp_off,
@@ -6509,7 +6528,17 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
     __shared__ alignas(16) half_t sW[BN * LD];
     __shared__ half_t s_e4m3[256];
 
+    __shared__ uint32_t sf4_pair[SF4_LOOKUP ? 256 : 1];
+    __shared__ uint32_t sf4_scale[SF4_LOOKUP ? 256 : 1];
     const int tid = threadIdx.x;
+    if constexpr (SF4_LOOKUP) {
+        if (desc.dn_code == CODE_SF4) {
+            const hv2 pair = {sf4_e2m1_f16(tid & 15u), sf4_e2m1_f16(tid >> 4)};
+            sf4_pair[tid] = __builtin_bit_cast(uint32_t, pair);
+            sf4_scale[tid] = h2_splat(e4m3fn_to_f32(static_cast<uint8_t>(tid)) * 0.0625f);
+            sync_lds();
+        }
+    }
     if (desc.dn_code == CODE_MX8) {
         s_e4m3[tid] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>(tid)));
         sync_lds();
@@ -6559,17 +6588,24 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
                 const int gb = (k0 >> 4) + b2;
                 half_t* dst = &sW[r * LD + b2 * 16];
                 if (gn < D) {
-                    const uint32_t sc2 = h2_splat(e4m3fn_to_f32(sf4_s[static_cast<size_t>(gn) * (inter >> 4) + gb]) * 0.0625f);
+                    const uint8_t packed_scale = sf4_s[static_cast<size_t>(gn) * (inter >> 4) + gb];
+                    const uint32_t sc2 = SF4_LOOKUP ? sf4_scale[packed_scale]
+                        : h2_splat(e4m3fn_to_f32(packed_scale) * 0.0625f);
                     const uint2 raw = *reinterpret_cast<const uint2*>(sf4_p + static_cast<size_t>(gn) * (inter >> 1) + gb * 8);
                     uint32_t o0[4], o1[4];
 #pragma unroll
                     for (int i = 0; i < 4; ++i) {
                         const uint32_t b0 = (raw.x >> (i * 8)) & 0xFFu;
                         const uint32_t b1 = (raw.y >> (i * 8)) & 0xFFu;
-                        const hv2 h0 = {sf4_e2m1_f16(b0 & 15u), sf4_e2m1_f16(b0 >> 4)};
-                        const hv2 h1 = {sf4_e2m1_f16(b1 & 15u), sf4_e2m1_f16(b1 >> 4)};
-                        o0[i] = h2_mul(__builtin_bit_cast(uint32_t, h0), sc2);
-                        o1[i] = h2_mul(__builtin_bit_cast(uint32_t, h1), sc2);
+                        if constexpr (SF4_LOOKUP) {
+                            o0[i] = h2_mul(sf4_pair[b0], sc2);
+                            o1[i] = h2_mul(sf4_pair[b1], sc2);
+                        } else {
+                            const hv2 h0 = {sf4_e2m1_f16(b0 & 15u), sf4_e2m1_f16(b0 >> 4)};
+                            const hv2 h1 = {sf4_e2m1_f16(b1 & 15u), sf4_e2m1_f16(b1 >> 4)};
+                            o0[i] = h2_mul(__builtin_bit_cast(uint32_t, h0), sc2);
+                            o1[i] = h2_mul(__builtin_bit_cast(uint32_t, h1), sc2);
+                        }
                     }
                     *reinterpret_cast<uint4*>(dst)     = make_uint4(o0[0], o0[1], o0[2], o0[3]);
                     *reinterpret_cast<uint4*>(dst + 8) = make_uint4(o1[0], o1[1], o1[2], o1[3]);

@@ -617,7 +617,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             proto("RESUME %d", reuse);
         }
         rq.reused_tokens = reuse;
-        rq.ckpt_pending = (pg.images.empty() && rq.prompt_len >= 16 && reuse < rq.prompt_len - 1);
+        rq.ckpt_pending = backend.supports_prompt_checkpoint() && pg.images.empty() &&
+                          rq.prompt_len >= 16 && reuse < rq.prompt_len - 1;
         rq.prefill_pos = reuse;
         rq.cur_pos = reuse;
         rq.hist = rq.prompt_ids;
