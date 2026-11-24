@@ -1131,6 +1131,9 @@ __global__ void __launch_bounds__(256) k2_shortconv4_batched(
     uint16_t* __restrict__ hist_pool,       // [max_slots, 3, C] (compact BF16 ring state matching CPU!)
     float* __restrict__ out,                // [M, C]
     int M, int C, int n_heads) {
+    // #6671: no FMA contraction here, so the fused and the separate forms of this step round alike (a verify window
+    // runs the separate form row by row; the one-token step runs the fused one)
+#pragma clang fp contract(off)
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y;
     if (c >= C || m >= M) return;
@@ -1175,6 +1178,9 @@ __global__ void __launch_bounds__(256) k2_shortconv4_grouped_seq(
     uint16_t* __restrict__ hist_pool,       // [max_slots, 3, C] BF16
     float* __restrict__ out,                // [M, C]
     int n_groups, int C, int n_heads) {
+    // #6671: no FMA contraction here, so the fused and the separate forms of this step round alike (a verify window
+    // runs the separate form row by row; the one-token step runs the fused one)
+#pragma clang fp contract(off)
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int g = blockIdx.y;
     if (c >= C || g >= n_groups) return;
@@ -1274,6 +1280,9 @@ __global__ void __launch_bounds__(256) k2_shortconv4_kv_pair(
     float* __restrict__ v_out,
     const int32_t* __restrict__ slot_ids,
     int M, int C, int n_heads) {
+    // #6671: no FMA contraction here, so the fused and the separate forms of this step round alike (a verify window
+    // runs the separate form row by row; the one-token step runs the fused one)
+#pragma clang fp contract(off)
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int by = blockIdx.y;
     const bool is_v = (by >= M);
@@ -1318,6 +1327,9 @@ __global__ void __launch_bounds__(256) k2_sconv_add_inplace(
     uint16_t* __restrict__ hist_pool,     // [max_slots, 3, D]
     float* __restrict__ cur,              // [M, D] (cur += sconv(in_x))
     int M, int D) {
+    // #6671: no FMA contraction here, so the fused and the separate forms of this step round alike (a verify window
+    // runs the separate form row by row; the one-token step runs the fused one)
+#pragma clang fp contract(off)
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y;
     if (c >= D || m >= M) return;
@@ -1439,7 +1451,7 @@ __global__ void __launch_bounds__(128) k2_qrkv_kvstore_relpos_fused(
     half_t* __restrict__ v_pool,
     bool apply_tau,
     float qk_clip, float rel_clip, float rms_eps,
-    int M, int n_head, int n_kv, int head_dim, int d_rel, int swa_window, int rel_extent) {
+    int M, int n_head, int n_kv, int head_dim, int d_rel, int swa_ring, int rel_extent) {
     const int bx = blockIdx.x;
     const int m = blockIdx.y;
     if (m >= M) return;
@@ -1524,7 +1536,7 @@ __global__ void __launch_bounds__(128) k2_qrkv_kvstore_relpos_fused(
         __syncthreads();
         if (tid < head_dim) {
             const int slot = slot_ids[m];
-            const int p = (swa_window > 0) ? (pos[m] % swa_window) : pos[m];
+            const int p = (swa_ring > 0) ? (pos[m] % swa_ring) : pos[m];
             const int phys = page_table[slot * max_pages_per_slot + (p >> 6)];
             const size_t dst = (static_cast<size_t>(phys) * 64 + (p & 63)) * (n_kv * head_dim) + h * head_dim + tid;
             k_pool[dst] = static_cast<half_t>(v * s_fac);
@@ -1544,7 +1556,7 @@ __global__ void __launch_bounds__(128) k2_qrkv_kvstore_relpos_fused(
         __syncthreads();
         if (tid < head_dim) {
             const int slot = slot_ids[m];
-            const int p = (swa_window > 0) ? (pos[m] % swa_window) : pos[m];
+            const int p = (swa_ring > 0) ? (pos[m] % swa_ring) : pos[m];
             const int phys = page_table[slot * max_pages_per_slot + (p >> 6)];
             const size_t dst = (static_cast<size_t>(phys) * 64 + (p & 63)) * (n_kv * head_dim) + h * head_dim + tid;
             v_pool[dst] = static_cast<half_t>(v * s_fac);
@@ -1573,14 +1585,14 @@ __global__ void __launch_bounds__(256) k3_kv_paged_store(
     void* __restrict__ v_pool,              // [n_phys_pages, 64, n_kv_heads, head_dim] (half_t or uint8_t)
     float* __restrict__ k_scales,           // nullptr or [n_phys_pages, 64] (for FP8_KV)
     float* __restrict__ v_scales,           // nullptr or [n_phys_pages, 64] (for FP8_KV)
-    int M, int n_kv_heads, int head_dim, int swa_window) {
+    int M, int n_kv_heads, int head_dim, int swa_ring) {
     const int m = blockIdx.x;
     if (m >= M) return;
     const int tid = threadIdx.x;
     const int elems = n_kv_heads * head_dim;
 
     const int slot = slot_ids[m];
-    const int p = (swa_window > 0) ? (pos[m] % swa_window) : pos[m];
+    const int p = (swa_ring > 0) ? (pos[m] % swa_ring) : pos[m];
     const int lpage = p >> 6;
     const int poff = p & 63;
     const int phys = page_table[slot * max_pages_per_slot + lpage];
@@ -1719,7 +1731,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa(
     const float* __restrict__ k_scales,     // nullptr or [n_phys_pages, 64]
     const float* __restrict__ v_scales,     // nullptr or [n_phys_pages, 64]
     float* __restrict__ O_out,              // [M, n_q_heads, 128]
-    int M, int n_q_heads, int n_kv_heads, int swa_window, int max_rel) {
+    int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
     const int wave = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int qh = blockIdx.x * 4 + wave;
@@ -1745,7 +1757,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa(
     const int32_t* pt_row = page_table + slot * max_pages_per_slot;
 
     for (int kp = k_start; kp <= cur_pos; ++kp) {
-        const int ring_p = (swa_window > 0) ? (kp % swa_window) : kp;
+        const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
         const int phys = pt_row[ring_p >> 6];
         const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
         const size_t base = tok_base * elems + kv_off;
@@ -1817,7 +1829,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_splitkv(
     const float* __restrict__ k_scales,
     const float* __restrict__ v_scales,
     float* __restrict__ O_out,
-    int M, int n_q_heads, int n_kv_heads, int swa_window, int max_rel) {
+    int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
     const int wave = threadIdx.x >> 5;  // 0..3 split across KV sequence!
     const int lane = threadIdx.x & 31;
     const int qh = blockIdx.x;
@@ -1843,7 +1855,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_splitkv(
     const int32_t* pt_row = page_table + slot * max_pages_per_slot;
 
     for (int kp = k_start + wave; kp <= cur_pos; kp += 4) {
-        const int ring_p = (swa_window > 0) ? (kp % swa_window) : kp;
+        const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
         const int phys = pt_row[ring_p >> 6];
         const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
         const size_t base = tok_base * elems + kv_off;
@@ -1934,7 +1946,7 @@ __global__ void __launch_bounds__(256) k3_flash_splitkv_part(
     const float* __restrict__ k_scales,
     const float* __restrict__ v_scales,
     float* __restrict__ partials,           // [M, n_q_heads, KSPLITS, 130]
-    int M, int n_q_heads, int n_kv_heads, int swa_window, int max_rel) {
+    int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
     const int wave = threadIdx.x >> 5;      // 0..7
     const int lane = threadIdx.x & 31;
     const int qh = blockIdx.x;
@@ -1966,7 +1978,7 @@ __global__ void __launch_bounds__(256) k3_flash_splitkv_part(
     const int32_t* pt_row = page_table + slot * max_pages_per_slot;
 
     for (int kp = sp_beg + wave; kp < sp_end; kp += 8) {
-        const int ring_p = (swa_window > 0) ? (kp % swa_window) : kp;
+        const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
         const int phys = pt_row[ring_p >> 6];
         const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
         const size_t base = tok_base * elems + kv_off;
@@ -2036,157 +2048,33 @@ __global__ void __launch_bounds__(256) k3_flash_splitkv_part(
     }
 }
 
-constexpr int kGlobalGqaSplits = 16;
-constexpr int kGlobalGqaStride = 132;
-
-__device__ __forceinline__ int fp8_gqa_splits(int length, int window) {
-    if (window > 0) return length >= 512 ? 8 : 4;
-    return length > 4096 ? kGlobalGqaSplits : 4;
-}
-
-// FP8 decode. Reuse each KV load across three query heads while
-// maintaining a separate online softmax state for each head.
-__global__ void __launch_bounds__(256) k3_flash_gqa_fp8_part(
-    const float* __restrict__ Q, const float* __restrict__ rel_bias,
-    const float* __restrict__ sink_logits, const int32_t* __restrict__ slots,
-    const int32_t* __restrict__ pos, const int32_t* __restrict__ page_table,
-    int max_pages_per_slot, const uint8_t* __restrict__ k_pool,
-    const uint8_t* __restrict__ v_pool, const float* __restrict__ k_scales,
-    const float* __restrict__ v_scales, float* __restrict__ partials,
-    int n_kv_heads, int max_rel, int window) {
-    constexpr int group = 3;
-    const int wave = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int kvh = blockIdx.x;
-    const int split = blockIdx.z;
-    const int cur = pos[0];
-    const int available = cur + 1;
-    const int length = window > 0 ? min(available, window) : available;
-    const int splits = fp8_gqa_splits(length, window);
-    if (split >= splits) return;
-    const int chunk = (length + splits - 1) / splits;
-    const int start = available - length + split * chunk;
-    const int end = min(available, start + chunk);
-    const int d0 = lane * 4;
-    const int32_t* pages = page_table + slots[0] * max_pages_per_slot;
-    const float qscale = rsqrtf(128.0f);
-
-    float4 q[group], out[group];
-    float max_l[group], sum[group];
-#pragma unroll
-    for (int h = 0; h < group; ++h) {
-        const int qh = kvh * group + h;
-        const float4 v = *reinterpret_cast<const float4*>(Q + qh * 128 + d0);
-        q[h] = make_float4(v.x * qscale, v.y * qscale, v.z * qscale, v.w * qscale);
-        out[h] = make_float4(0, 0, 0, 0);
-        const bool sink = split == 0 && wave == 0 && sink_logits;
-        max_l[h] = sink ? sink_logits[qh] : -1e30f;
-        sum[h] = sink ? 1.0f : 0.0f;
-    }
-    auto load = [](const uint8_t* pool, size_t idx, float scale) {
-        const uint32_t w = *reinterpret_cast<const uint32_t*>(pool + idx);
-#if INK_GFX12 && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
-        const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(w, false);
-        const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(w, true);
-        // Match the software decoder's zero result for the two NaN encodings.
-        return make_float4((__builtin_isnan(lo[0]) ? 0.0f : lo[0]) * scale,
-                           (__builtin_isnan(lo[1]) ? 0.0f : lo[1]) * scale,
-                           (__builtin_isnan(hi[0]) ? 0.0f : hi[0]) * scale,
-                           (__builtin_isnan(hi[1]) ? 0.0f : hi[1]) * scale);
-#else
-        return make_float4(e4m3fn_to_f32(static_cast<uint8_t>(w)) * scale,
-                           e4m3fn_to_f32(static_cast<uint8_t>(w >> 8)) * scale,
-                           e4m3fn_to_f32(static_cast<uint8_t>(w >> 16)) * scale,
-                           e4m3fn_to_f32(static_cast<uint8_t>(w >> 24)) * scale);
-#endif
-    };
-    for (int p = start + wave; p < end; p += 8) {
-        const int ring = window > 0 ? p % window : p;
-        const size_t token = static_cast<size_t>(pages[ring >> 6]) * 64 + (ring & 63);
-        const size_t idx = (token * n_kv_heads + kvh) * 128 + d0;
-        const float4 k = load(k_pool, idx, k_scales[token]);
-        const float4 v = load(v_pool, idx, v_scales[token]);
-        const int dist = cur - p;
-#pragma unroll
-        for (int h = 0; h < group; ++h) {
-            const float4 a = q[h];
-            float score = wave32_sum(fmaf(a.x, k.x, fmaf(a.y, k.y, fmaf(a.z, k.z, a.w * k.w))));
-            if (rel_bias && dist < max_rel) score += rel_bias[(kvh * group + h) * max_rel + dist];
-            const float m = fmaxf(max_l[h], score);
-            const float alpha = __expf(max_l[h] - m), beta = __expf(score - m);
-            out[h].x = fmaf(out[h].x, alpha, beta * v.x);
-            out[h].y = fmaf(out[h].y, alpha, beta * v.y);
-            out[h].z = fmaf(out[h].z, alpha, beta * v.z);
-            out[h].w = fmaf(out[h].w, alpha, beta * v.w);
-            sum[h] = fmaf(sum[h], alpha, beta);
-            max_l[h] = m;
-        }
-    }
-
-    __shared__ float s_max[group][8], s_sum[group][8];
-    __shared__ alignas(16) float4 s_out[group][8][32];
-#pragma unroll
-    for (int h = 0; h < group; ++h) {
-        if (lane == 0) { s_max[h][wave] = max_l[h]; s_sum[h][wave] = sum[h]; }
-        s_out[h][wave][lane] = out[h];
-    }
-    __syncthreads();
-    if (wave >= group) return;
-    const int h = wave;
-    float maximum = -1e30f;
-#pragma unroll
-    for (int w = 0; w < 8; ++w) maximum = fmaxf(maximum, s_max[h][w]);
-    float total = 0.0f;
-    float4 acc = make_float4(0, 0, 0, 0);
-#pragma unroll
-    for (int w = 0; w < 8; ++w) {
-        if (s_sum[h][w] > 0.0f) {
-            const float weight = __expf(s_max[h][w] - maximum);
-            total += weight * s_sum[h][w];
-            const float4 v = s_out[h][w][lane];
-            acc.x = fmaf(weight, v.x, acc.x);
-            acc.y = fmaf(weight, v.y, acc.y);
-            acc.z = fmaf(weight, v.z, acc.z);
-            acc.w = fmaf(weight, v.w, acc.w);
-        }
-    }
-    float* dst = partials + ((kvh * group + h) * kGlobalGqaSplits + split) * kGlobalGqaStride;
-    *reinterpret_cast<float4*>(dst + d0) = acc;
-    if (lane == 0) { dst[128] = maximum; dst[129] = total; }
-}
-
-// Stage 2: Merge split-KV partials and apply sigmoid(gate_attn).
+// Stage 2: Merges KSPLITS partials + applies sigmoid(gate_attn) (< 5 us!)
 // Grid = (n_q_heads, M), Block = 32 (1 wave = 128 dims!)
-template <int KSPLITS = 4, int STRIDE = 130>
+template <int KSPLITS = 4>
 __global__ void __launch_bounds__(32) k3_flash_splitkv_reduce(
     const float* __restrict__ partials,
     const float* __restrict__ gate_attn,
     float* __restrict__ O_out,
-    int M, int n_q_heads, const int32_t* pos = nullptr, int window = 0) {
+    int M, int n_q_heads) {
     const int lane = threadIdx.x & 31;
     const int qh = blockIdx.x;
     const int m = blockIdx.y;
     if (qh >= n_q_heads || m >= M) return;
     const int d0 = lane * 4;
-    const float* base = partials + (static_cast<size_t>(m) * n_q_heads + qh) * KSPLITS * STRIDE;
-    int splits = KSPLITS;
-    if constexpr (KSPLITS == kGlobalGqaSplits && STRIDE == kGlobalGqaStride) {
-        const int available = pos[m] + 1;
-        splits = fp8_gqa_splits(window > 0 ? min(available, window) : available, window);
-    }
+    const float* base = partials + (static_cast<size_t>(m) * n_q_heads + qh) * KSPLITS * 130;
 
     float gmax = -1e30f;
 #pragma unroll
-    for (int s = 0; s < splits; ++s) gmax = fmaxf(gmax, base[s * STRIDE + 128]);
+    for (int s = 0; s < KSPLITS; ++s) gmax = fmaxf(gmax, base[s * 130 + 128]);
     float tot_s = 0.0f;
     float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
 #pragma unroll
-    for (int s = 0; s < splits; ++s) {
-        const float ls = base[s * STRIDE + 129];
+    for (int s = 0; s < KSPLITS; ++s) {
+        const float ls = base[s * 130 + 129];
         if (ls > 0.0f) {
-            const float wt = __expf(base[s * STRIDE + 128] - gmax);
+            const float wt = __expf(base[s * 130 + 128] - gmax);
             tot_s += wt * ls;
-            const float4 p = *reinterpret_cast<const float4*>(base + s * STRIDE + d0);
+            const float4 p = *reinterpret_cast<const float4*>(base + s * 130 + d0);
             r0 = fmaf(wt, p.x, r0); r1 = fmaf(wt, p.y, r1);
             r2 = fmaf(wt, p.z, r2); r3 = fmaf(wt, p.w, r3);
         }
@@ -2210,7 +2098,7 @@ __global__ void __launch_bounds__(32) k3_flash_splitkv_reduce(
 // Total LDS = 27.0 KB (< 32 KB -> 2 WG/CU!). Guarded #if INK_HAS_WMMA (zero WMMA emitted on RDNA2!).
 // Grid: (n_q_heads, (M + 63) / 64), Block: 128 (4 waves -> 16 Q rows per wave)
 // =================================================================================================
-template <bool FP8_KV, bool FAST_FP8 = false>
+template <bool FP8_KV>
 __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
     const float* __restrict__ Q,            // [M, n_q_heads, 128]
     const float* __restrict__ gate_attn,    // nullptr or [M, n_q_heads, 128]
@@ -2225,7 +2113,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
     const float* __restrict__ k_scales,
     const float* __restrict__ v_scales,
     float* __restrict__ O_out,
-    int M, int n_q_heads, int n_kv_heads, int swa_window, int max_rel) {
+    int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
 #if INK_HAS_WMMA
     constexpr int BQ = 64, BK = 64, HD = 128;
     constexpr int LDK = HD + 8;   // 136 -> 64 * 136 * 2 = 17,408 B
@@ -2310,38 +2198,8 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
     const int k_begin = (swa_window > 0 && q_min_pos >= swa_window) ? (q_min_pos - swa_window + 1) : 0;
     const int k_blk_start = (k_begin / BK) * BK;
 
-    const auto unpack_fp8 = [](uint32_t packed, float scale) {
-#if INK_GFX12 && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
-        if constexpr (FAST_FP8) {
-            const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(packed, false);
-            const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(packed, true);
-            // The software decoder maps both E4M3FN NaN encodings to zero.
-            return make_float4((__builtin_isnan(lo[0]) ? 0.0f : lo[0]) * scale,
-                               (__builtin_isnan(lo[1]) ? 0.0f : lo[1]) * scale,
-                               (__builtin_isnan(hi[0]) ? 0.0f : hi[0]) * scale,
-                               (__builtin_isnan(hi[1]) ? 0.0f : hi[1]) * scale);
-        }
-#endif
-        return make_float4(e4m3fn_to_f32(static_cast<uint8_t>(packed)) * scale,
-                           e4m3fn_to_f32(static_cast<uint8_t>(packed >> 8)) * scale,
-                           e4m3fn_to_f32(static_cast<uint8_t>(packed >> 16)) * scale,
-                           e4m3fn_to_f32(static_cast<uint8_t>(packed >> 24)) * scale);
-    };
-
     // 3. Main FlashAttention-2 loop over KV blocks [kb .. kb + 63]
     for (int kb = k_blk_start; kb <= q_max_pos; kb += BK) {
-        // Each 64-token global tile is one KV page. A sliding-window tile can straddle the ring wrap.
-        size_t page_base = 0;
-        if constexpr (FAST_FP8) {
-            if (swa_window == 0) page_base = static_cast<size_t>(pt_row[kb >> 6]) * 64;
-        }
-        const auto kv_token = [&](int kp, int tile_row) {
-            if constexpr (FAST_FP8) {
-                if (swa_window == 0) return page_base + tile_row;
-            }
-            const int ring = (swa_window > 0) ? (kp % swa_window) : kp;
-            return static_cast<size_t>(pt_row[ring >> 6]) * 64 + (ring & 63);
-        };
         // 3A. Load K[64, 128] FP16 into kv.sK[64 * LDK]
         for (int idx = tid; idx < BK * (HD / 4); idx += 128) {
             const int r = idx >> 5;
@@ -2349,16 +2207,17 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
             const int kp = kb + r;
             half_t* dst = &kv.sK[r * LDK + c4 * 4];
             if (kp <= q_max_pos) {
-                const size_t tok_base = kv_token(kp, r);
+                const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
+                const int phys = pt_row[ring_p >> 6];
+                const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
                 const size_t base = tok_base * elems + kv_off + c4 * 4;
                 if constexpr (FP8_KV) {
                     const float ks = k_scales ? k_scales[tok_base] : 1.0f;
                     const uint32_t kw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(k_pool) + base);
-                    const float4 decoded = unpack_fp8(kw, ks);
-                    dst[0] = static_cast<half_t>(decoded.x);
-                    dst[1] = static_cast<half_t>(decoded.y);
-                    dst[2] = static_cast<half_t>(decoded.z);
-                    dst[3] = static_cast<half_t>(decoded.w);
+                    dst[0] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks);
+                    dst[1] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks);
+                    dst[2] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks);
+                    dst[3] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks);
                 } else {
                     *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(k_pool) + base);
                 }
@@ -2450,16 +2309,17 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
             const int kp = kb + r;
             const int d0 = c4 * 4;
             if (kp <= q_max_pos) {
-                const size_t tok_base = kv_token(kp, r);
+                const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
+                const int phys = pt_row[ring_p >> 6];
+                const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
                 const size_t base = tok_base * elems + kv_off + d0;
                 if constexpr (FP8_KV) {
                     const float vs = v_scales ? v_scales[tok_base] : 1.0f;
                     const uint32_t vw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(v_pool) + base);
-                    const float4 decoded = unpack_fp8(vw, vs);
-                    kv.sVt[(d0 + 0) * LDV + r] = static_cast<half_t>(decoded.x);
-                    kv.sVt[(d0 + 1) * LDV + r] = static_cast<half_t>(decoded.y);
-                    kv.sVt[(d0 + 2) * LDV + r] = static_cast<half_t>(decoded.z);
-                    kv.sVt[(d0 + 3) * LDV + r] = static_cast<half_t>(decoded.w);
+                    kv.sVt[(d0 + 0) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs);
+                    kv.sVt[(d0 + 1) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs);
+                    kv.sVt[(d0 + 2) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs);
+                    kv.sVt[(d0 + 3) * LDV + r] = static_cast<half_t>(e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs);
                 } else {
                     const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
                     const hv2 v01 = __builtin_bit_cast(hv2, vw.x);
@@ -2514,7 +2374,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_prefill_wmma(
 #else
     (void)Q; (void)gate_attn; (void)rel_bias; (void)sink_logit; (void)slot; (void)base_pos;
     (void)page_table; (void)max_pages_per_slot; (void)k_pool; (void)v_pool; (void)k_scales; (void)v_scales;
-    (void)O_out; (void)M; (void)n_q_heads; (void)n_kv_heads; (void)swa_window; (void)max_rel;
+    (void)O_out; (void)M; (void)n_q_heads; (void)n_kv_heads; (void)swa_window; (void)swa_ring; (void)max_rel;
 #endif
 }
 
@@ -3473,45 +3333,6 @@ __global__ void __launch_bounds__(256) k_unembed_softcap(
     }
 }
 
-// Single-row S6_K unembed for the 2304-wide Inkling trunk. Cache the entire
-// FP16 input in LDS so all eight output waves can finish without tile barriers.
-constexpr int kS6DecodeHidden = 2304;
-__global__ void __launch_bounds__(256) k_unembed_s6_decode(
-    const uint8_t* __restrict__ unemb_raw,
-    const float* __restrict__ hidden,
-    float* __restrict__ logits,
-    int vocab, float softcap) {
-    constexpr int superblocks = kS6DecodeHidden / 256;
-    constexpr int block_bytes = 198;
-    const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int v = blockIdx.x * 8 + (tid >> 5);
-
-    __shared__ alignas(16) half_t input[kS6DecodeHidden];
-    for (int i = tid; i < kS6DecodeHidden; i += 256) {
-        input[i] = static_cast<half_t>(hidden[i]);
-    }
-    __syncthreads();
-    if (v >= vocab) return;
-
-    const int j = lane * 8;
-    const uint8_t* row = unemb_raw + static_cast<size_t>(v) * superblocks * block_bytes;
-    float acc = 0.0f;
-    for (int s = 0; s < superblocks; ++s) {
-        const uint8_t* block = row + s * block_bytes;
-        const float scale = decode_sk_sub_eff_i8(block, CODE_S6_K, j >> 6);
-        const uint4 w = decode_sk_8_unscaled_f16(block + 6, CODE_S6_K, j);
-        const uint4 x = *reinterpret_cast<const uint4*>(&input[s * 256 + j]);
-        float dot = fdot2_f32(w.x, x.x, 0.0f);
-        dot = fdot2_f32(w.y, x.y, dot);
-        dot = fdot2_f32(w.z, x.z, dot);
-        dot = fdot2_f32(w.w, x.w, dot);
-        acc = fmaf(dot, scale, acc);
-    }
-    const float z = wave32_sum(acc);
-    if (lane == 0) logits[v] = softcap * tanhf(z * (1.0f / softcap));
-}
-
 // Multi-format DSpark combined unembed argmax stage 1: computes dot(unemb[v], combined) for all V, deterministic first-max!
 // Uses LDS-cached FP16 combined vector + fast 32-bit S_K unpack + fdot2_f32 for 3x faster Markov drafting!
 __global__ void __launch_bounds__(256) k5_dspark_packed_argmax_stage1(
@@ -4246,6 +4067,27 @@ __global__ void __launch_bounds__(64) k_vit_full_attn(
         max_l = nm;
     }
     O[(static_cast<size_t>(qi) * H + h) * hd + d] = o_acc / fmaxf(sum_e, 1e-30f);
+}
+
+// #6671 diagnostics (STRATA_INK_HASH=1): an order independent 64-bit hash of every FP32 bit of one row, so a verify window
+// can be compared stage by stage with the one-token steps.  Block per row, 256 threads.
+__global__ void __launch_bounds__(256) k_dbg_hash_rows(const float* __restrict__ x, int D, unsigned long long* __restrict__ out,
+                                                        int slot, int nslots) {
+    __shared__ unsigned long long sh[256];
+    const float* row = x + static_cast<size_t>(blockIdx.x) * D;
+    unsigned long long acc = 0;
+    for (int d = threadIdx.x; d < D; d += 256) {
+        unsigned long long z = static_cast<unsigned long long>(__float_as_uint(row[d])) + 0x9E3779B97F4A7C15ull * static_cast<unsigned long long>(d + 1);
+        z ^= z >> 30; z *= 0xBF58476D1CE4E5B9ull; z ^= z >> 27; z *= 0x94D049BB133111EBull; z ^= z >> 31;
+        acc += z;
+    }
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[static_cast<size_t>(blockIdx.x) * nslots + slot] = sh[0];
 }
 
 }  // namespace strata::inkling2::hip

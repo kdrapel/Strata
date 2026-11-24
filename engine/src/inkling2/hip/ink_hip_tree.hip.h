@@ -457,6 +457,9 @@ __global__ void __launch_bounds__(256) k2_shortconv4_tree(
     uint16_t* __restrict__ rec_visit_out,   // [kTreeMaxM, C] (records BF16 cur[m, c]!)
     float* __restrict__ out,                // [M, C]
     int M, int C, int n_heads) {
+    // #6671: no FMA contraction here, so the fused and the separate forms of this step round alike (a verify window
+    // runs the separate form row by row; the one-token step runs the fused one)
+#pragma clang fp contract(off)
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int m = blockIdx.y;
     if (c >= C || m >= M) return;
@@ -611,7 +614,7 @@ __global__ void __launch_bounds__(128) k2_qrkv_treestore_relpos_fused(
 
 // 4-Wave Split-KV Exact Tree Flash-SWA / Flash-GQA Attention (Prefix Paged KV + Bitmask Tree Ancestors!)
 // Grid: (n_q_heads, M), Block: 128
-template <bool FP8_KV, bool NATIVE_FP8 = false, bool GLOBAL_PAGES = false>
+template <bool FP8_KV>
 __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
     const float* __restrict__ Q,            // [M, n_q_heads, 128]
     const float* __restrict__ gate_attn,    // nullptr or [M, n_q_heads, 128]
@@ -628,7 +631,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
     const half_t* __restrict__ tree_k,      // [kTreeMaxM, n_kv_heads * 128]
     const half_t* __restrict__ tree_v,      // [kTreeMaxM, n_kv_heads * 128]
     float* __restrict__ O_out,
-    int M, int n_q_heads, int n_kv_heads, int swa_window, int max_rel) {
+    int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
     const int wave = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int qh = blockIdx.x;
@@ -654,7 +657,11 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
     const float* rb_row = rel_bias ? (rel_bias + (static_cast<size_t>(m) * n_q_heads + qh) * max_rel) : nullptr;
     const int32_t* pt_row = page_table + slot * max_pages_per_slot;
 
-    const auto attend_prefix = [&](int kp, size_t tok_base) {
+    // 1. Attend to committed prefix [k_start, base_pos - 1] across all 4 waves
+    for (int kp = k_start + wave; kp < base_pos; kp += 4) {
+        const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
+        const int phys = pt_row[ring_p >> 6];
+        const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
         const size_t base = tok_base * elems + kv_off;
 
         float k0, k1, k2, k3, v0, v1, v2, v3;
@@ -663,33 +670,14 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
             const float vs = v_scales ? v_scales[tok_base] : 1.0f;
             const uint32_t kw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(k_pool) + base);
             const uint32_t vw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(v_pool) + base);
-#if INK_GFX12 && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
-            if constexpr (NATIVE_FP8) {
-                const auto k_lo = __builtin_amdgcn_cvt_pk_f32_fp8(kw, false);
-                const auto k_hi = __builtin_amdgcn_cvt_pk_f32_fp8(kw, true);
-                const auto v_lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw, false);
-                const auto v_hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw, true);
-                // Match the software decoder's treatment of both NaN encodings.
-                k0 = (__builtin_isnan(k_lo[0]) ? 0.0f : k_lo[0]) * ks;
-                k1 = (__builtin_isnan(k_lo[1]) ? 0.0f : k_lo[1]) * ks;
-                k2 = (__builtin_isnan(k_hi[0]) ? 0.0f : k_hi[0]) * ks;
-                k3 = (__builtin_isnan(k_hi[1]) ? 0.0f : k_hi[1]) * ks;
-                v0 = (__builtin_isnan(v_lo[0]) ? 0.0f : v_lo[0]) * vs;
-                v1 = (__builtin_isnan(v_lo[1]) ? 0.0f : v_lo[1]) * vs;
-                v2 = (__builtin_isnan(v_hi[0]) ? 0.0f : v_hi[0]) * vs;
-                v3 = (__builtin_isnan(v_hi[1]) ? 0.0f : v_hi[1]) * vs;
-            } else
-#endif
-            {
-                k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
-                k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
-                k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
-                k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
-                v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
-                v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
-                v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
-                v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
-            }
+            k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
+            k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
+            k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
+            k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
+            v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
+            v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
+            v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
+            v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
         } else {
             const uint2 kw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(k_pool) + base);
             const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
@@ -708,23 +696,6 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
         o2 = fmaf(o2, alpha, beta * v2); o3 = fmaf(o3, alpha, beta * v3);
         sum_exp = fmaf(sum_exp, alpha, beta);
         max_l = new_max;
-    };
-
-    // Keep each wave's position order, but resolve the page table only once per page.
-    // The ring for sliding-window layers may wrap within a logical page.
-    if constexpr (GLOBAL_PAGES) {
-        for (int page_start = 0; page_start < base_pos; page_start += 64) {
-            const size_t token = static_cast<size_t>(pt_row[page_start >> 6]) * 64;
-            const int end = min(64, base_pos - page_start);
-            for (int offset = wave; offset < end; offset += 4) {
-                attend_prefix(page_start + offset, token + offset);
-            }
-        }
-    } else {
-        for (int kp = k_start + wave; kp < base_pos; kp += 4) {
-            const int ring = swa_window > 0 ? kp % swa_window : kp;
-            attend_prefix(kp, static_cast<size_t>(pt_row[ring >> 6]) * 64 + (ring & 63));
-        }
     }
 
     // 2. Wave 0 attends to bitmask-selected tree ancestors j in [0..M-1] (L2-resident!)
@@ -782,6 +753,133 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
             r3 *= 1.0f / (1.0f + __expf(-gv.w));
         }
         *reinterpret_cast<float4*>(O_out + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0) = make_float4(r0, r1, r2, r3);
+    }
+}
+
+// #6671: tree attention with the arithmetic of the one-token step (k3_flash_splitkv_part + k3_flash_splitkv_reduce, KSPLITS = 4):
+// the same split of the keys [k_start, pos] into four chunks, the same wave walk (kp = sp_beg + wave, step 8), the same online
+// softmax and the same two-level merge, so that row m of a verify tree is the value the step at that position gives.  Keys below
+// base_pos come from the paged pool, the keys above it are the node's ancestors in the tree scratch (FP16, the value the pool
+// would hold; FP16 KV only).  Stage 2 is k3_flash_splitkv_reduce.  Grid: (n_q_heads, M, 4), Block: 256
+__global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part(
+    const float* __restrict__ Q,
+    const float* __restrict__ rel_bias,
+    const float* __restrict__ sink_logit,
+    const TreeMetaDev* __restrict__ tmeta,
+    const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ page_table,
+    int max_pages_per_slot,
+    const void* __restrict__ k_pool,
+    const void* __restrict__ v_pool,
+    const half_t* __restrict__ tree_k,
+    const half_t* __restrict__ tree_v,
+    float* __restrict__ partials,           // [M, n_q_heads, 4, 130]
+    int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
+    constexpr int KSPLITS = 4;
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int qh = blockIdx.x;
+    const int m = blockIdx.y;
+    const int sp = blockIdx.z;
+    if (qh >= n_q_heads || m >= M || sp >= KSPLITS) return;
+
+    __shared__ int s_anc[kTreeMaxM];        // node index of this row's ancestor at depth t (t = 0 .. cur_pos - base_pos)
+    const int base_pos = tmeta->base_pos;
+    const int cur_pos = pos[m];
+    if (threadIdx.x < kTreeMaxM) {
+        int found = -1;
+        const int t = threadIdx.x;
+        const uint32_t tmask = tmeta->mask[m];
+        for (int j = 0; j < M; ++j) {
+            if (((tmask >> j) & 1u) && pos[j] - base_pos == t) found = j;
+        }
+        s_anc[t] = found;
+    }
+    __syncthreads();
+
+    const int d0 = lane * 4;
+    const int kvh = qh / (n_q_heads / n_kv_heads);
+    const int slot = tmeta->slot;
+    const int k_start = (swa_window > 0 && cur_pos >= swa_window) ? (cur_pos - swa_window + 1) : 0;
+    const int total_kv = cur_pos - k_start + 1;
+    const int chunk = (total_kv + KSPLITS - 1) / KSPLITS;
+    const int sp_beg = k_start + sp * chunk;
+    const int sp_end = min(cur_pos + 1, sp_beg + chunk);
+
+    const float scale = rsqrtf(128.0f);
+    const float4 qv = *reinterpret_cast<const float4*>(Q + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0);
+    const float q0 = qv.x * scale, q1 = qv.y * scale, q2 = qv.z * scale, q3 = qv.w * scale;
+
+    float max_l = (sp == 0 && wave == 0 && sink_logit) ? sink_logit[static_cast<size_t>(m) * n_q_heads + qh] : -1e30f;
+    float sum_exp = (sp == 0 && wave == 0 && sink_logit) ? 1.0f : 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    const int elems = n_kv_heads * 128;
+    const int kv_off = kvh * 128 + d0;
+    const float* rb_row = rel_bias ? (rel_bias + (static_cast<size_t>(m) * n_q_heads + qh) * max_rel) : nullptr;
+    const int32_t* pt_row = page_table + slot * max_pages_per_slot;
+
+    for (int kp = sp_beg + wave; kp < sp_end; kp += 8) {
+        float k0, k1, k2, k3, v0, v1, v2, v3;
+        if (kp < base_pos) {
+            const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
+            const int phys = pt_row[ring_p >> 6];
+            const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
+            const size_t base = tok_base * elems + kv_off;
+            const uint2 kw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(k_pool) + base);
+            const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
+            h2_unpack(kw.x, k0, k1); h2_unpack(kw.y, k2, k3);
+            h2_unpack(vw.x, v0, v1); h2_unpack(vw.y, v2, v3);
+        } else {
+            const int j = s_anc[kp - base_pos];
+            const size_t tbase = static_cast<size_t>(j) * elems + kv_off;
+            const uint2 kw = *reinterpret_cast<const uint2*>(tree_k + tbase);
+            const uint2 vw = *reinterpret_cast<const uint2*>(tree_v + tbase);
+            h2_unpack(kw.x, k0, k1); h2_unpack(kw.y, k2, k3);
+            h2_unpack(vw.x, v0, v1); h2_unpack(vw.y, v2, v3);
+        }
+
+        float sc = wave32_sum(fmaf(q0, k0, fmaf(q1, k1, fmaf(q2, k2, q3 * k3))));
+        const int dist = cur_pos - kp;
+        if (rb_row && dist < max_rel) sc += rb_row[dist];
+
+        const float new_max = fmaxf(max_l, sc);
+        const float alpha = __expf(max_l - new_max);
+        const float beta = __expf(sc - new_max);
+        o0 = fmaf(o0, alpha, beta * v0);
+        o1 = fmaf(o1, alpha, beta * v1);
+        o2 = fmaf(o2, alpha, beta * v2);
+        o3 = fmaf(o3, alpha, beta * v3);
+        sum_exp = fmaf(sum_exp, alpha, beta);
+        max_l = new_max;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ alignas(16) float4 s_o[8][32];
+    if (lane == 0) { s_max[wave] = max_l; s_sum[wave] = sum_exp; }
+    s_o[wave][lane] = make_float4(o0, o1, o2, o3);
+    __syncthreads();
+
+    if (wave == 0) {
+        float gmax = -1e30f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) gmax = fmaxf(gmax, s_max[w]);
+        float tot_s = 0.0f;
+        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (s_sum[w] > 0.0f) {
+                const float wt = __expf(s_max[w] - gmax);
+                tot_s += wt * s_sum[w];
+                const float4 p = s_o[w][lane];
+                r0 = fmaf(wt, p.x, r0); r1 = fmaf(wt, p.y, r1);
+                r2 = fmaf(wt, p.z, r2); r3 = fmaf(wt, p.w, r3);
+            }
+        }
+        float* dst = partials + ((static_cast<size_t>(m) * n_q_heads + qh) * KSPLITS + sp) * 130;
+        *reinterpret_cast<float4*>(dst + d0) = make_float4(r0, r1, r2, r3);
+        if (lane == 0) { dst[128] = gmax; dst[129] = tot_s; }
     }
 }
 
@@ -1102,7 +1200,7 @@ struct KvVisitDesc {
     float*         v_scales;
     const int32_t* d_pt;
     int            max_pages_per_slot;
-    int            swa_window;
+    int            swa_ring;   // SWA ring positions (0 = global visit)
 };
 
 // Commit winning path K/V across ALL 48 visits in ONE SINGLE KERNEL LAUNCH!
@@ -1119,7 +1217,7 @@ __global__ void __launch_bounds__(256) k3_kv_commit_tree_all(
     const int tid = threadIdx.x;
 
     const KvVisitDesc vd = visits[v];
-    const int p = (vd.swa_window > 0) ? ((base_pos + k) % vd.swa_window) : (base_pos + k);
+    const int p = (vd.swa_ring > 0) ? ((base_pos + k) % vd.swa_ring) : (base_pos + k);
     const int phys = vd.d_pt[slot * vd.max_pages_per_slot + (p >> 6)];
     const size_t tok_base = static_cast<size_t>(phys) * 64 + (p & 63);
     const size_t dst_base = tok_base * elems;
