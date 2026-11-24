@@ -3921,7 +3921,7 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn_dyn(
     const float* __restrict__ drf_V,       // [B, KV, 128] F32
     const int32_t* __restrict__ anchor_ptr,// [1]
     float* __restrict__ O_out,             // [B, H, 128]
-    int B, int H, int KV, int swa_win) {
+    int B, int H, int KV, int swa_win, int position_mask) {
     const int wave = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int hh = blockIdx.x * 4 + wave;
@@ -3945,7 +3945,7 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn_dyn(
     for (int t = 0; t < tot; ++t) {
         float k0, k1, k2, k3, v0, v1, v2, v3;
         if (t < c_len) {
-            const size_t idx = (static_cast<size_t>(c0 + t) * KV + kvh) * 128 + d0;
+            const size_t idx = (static_cast<size_t>((c0 + t) & position_mask) * KV + kvh) * 128 + d0;
             const uint2 kw = *reinterpret_cast<const uint2*>(ctx_K + idx);
             const uint2 vw = *reinterpret_cast<const uint2*>(ctx_V + idx);
             k0 = bf16_to_f32(kw.x & 0xFFFFu); k1 = bf16_to_f32(kw.x >> 16);
@@ -3994,10 +3994,10 @@ __global__ void __launch_bounds__(256) k_dspark_load_frnn_zero(
     const int32_t* __restrict__ anchor_ptr,
     float* __restrict__ dst_frnn,
     float* __restrict__ dst_state,
-    int D, int rank) {
+    int D, int rank, int position_mask) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < D) {
-        const int pos = anchor_ptr[0] - 1;
+        const int pos = (anchor_ptr[0] - 1) & position_mask;
         dst_frnn[i] = bf16_to_f32(frnn_base[static_cast<size_t>(pos) * D + i]);
     }
     if (i < rank) dst_state[i] = 0.0f;

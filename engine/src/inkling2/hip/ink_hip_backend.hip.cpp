@@ -2006,7 +2006,7 @@ public:
             k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B), 128, 0, stream_>>>(
                 q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                 reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
-                kd, vd, d_toks, ao, B, H, KV, swa_w);
+                kd, vd, d_toks, ao, B, H, KV, swa_w, -1);
 
             launch_bf16_opt(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B, D, q_dim);
             k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B * D);
@@ -2028,7 +2028,7 @@ public:
         k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B, D, dspark_cfg_.rms_eps);
         k_dspark_load_frnn_zero<<<(std::max(D, rank) + 255) / 256, 256, 0, stream_>>>(
             reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr), d_toks,
-            res, reinterpret_cast<float*>(d_dspark_state_.dev_ptr), D, rank);
+            res, reinterpret_cast<float*>(d_dspark_state_.dev_ptr), D, rank, -1);
         if (ds_prof) (void)hipEventRecord(devt[1], stream_);
 
         const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
@@ -2262,7 +2262,7 @@ public:
                     k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B_ds), 128, 0, stream_>>>(
                         q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                         reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
-                        kd, vd, d_hdr, ao, B_ds, H, KV, swa_w);
+                        kd, vd, d_hdr, ao, B_ds, H, KV, swa_w, -1);
                     launch_bf16_opt(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B_ds, D, q_dim);
                     k_vec_add<<<(B_ds * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B_ds * D);
 
@@ -2276,7 +2276,7 @@ public:
                 k_rms_norm_rows<<<B_ds, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B_ds, D, dspark_cfg_.rms_eps);
                 k_dspark_load_frnn_zero<<<(std::max(D, rank) + 255) / 256, 256, 0, stream_>>>(
                     reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr), d_hdr,
-                    res, reinterpret_cast<float*>(d_beam_st_a_.dev_ptr), D, rank);
+                    res, reinterpret_cast<float*>(d_beam_st_a_.dev_ptr), D, rank, -1);
 
                 const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
                 const int V = c_.vocab_unpadded;
