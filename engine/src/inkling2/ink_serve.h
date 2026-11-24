@@ -930,6 +930,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                         if (is_last) logit_slots.push_back(s);
                     }
                     prefill_fed[s] = take;
+                    if (pf_slots.size() == 1 && batch.n_tokens == take && rq.prefill_pos == 0)
+                        batch.initial_prompt_tokens = rq.prompt_len;
                 }
             }
         }

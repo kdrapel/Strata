@@ -429,6 +429,7 @@ struct SlotShortConvState {
 // ---- Batched Step Descriptor (coalesces 1..64 active requests + chunked prefill + DSpark verify into one 48-visit pass!) ----
 struct StepBatch {
     int n_tokens = 0;
+    int initial_prompt_tokens = 0;   // Full length of a fresh single-slot prompt, or zero
     std::vector<int32_t> slot_ids;    // [n_tokens] slot index in [0..63]
     std::vector<int32_t> pos;         // [n_tokens] sequence position in slot
     std::vector<int32_t> token_ids;   // [n_tokens] input token id (ignored if img_embed_idx[i] >= 0)
@@ -439,6 +440,7 @@ struct StepBatch {
 
     void clear() {
         n_tokens = 0;
+        initial_prompt_tokens = 0;
         slot_ids.clear();
         pos.clear();
         token_ids.clear();

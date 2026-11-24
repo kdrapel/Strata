@@ -28,6 +28,7 @@
 #endif
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -117,11 +118,11 @@ __global__ void __launch_bounds__(256) k_dspark_ctx_scatter(
     uint16_t* const* __restrict__ dst_tbl, // [max_slots] per-slot base pointers
     const int32_t* __restrict__ slot_ids,  // [B]
     const int32_t* __restrict__ pos,       // [B]
-    int B, int cols) {
+    int B, int cols, int position_mask) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int b = blockIdx.y;
     if (c >= cols || b >= B) return;
-    uint16_t* dst = dst_tbl[slot_ids[b]] + static_cast<size_t>(pos[b]) * cols;
+    uint16_t* dst = dst_tbl[slot_ids[b]] + static_cast<size_t>(pos[b] & position_mask) * cols;
     dst[c] = strata::inkling2::hip::f32_to_bf16(src[static_cast<size_t>(b) * cols + c]);
 }
 
@@ -391,6 +392,17 @@ struct VisitKvPool {
         return true;
     }
 
+    bool reserve_empty(int pages) {
+        if (cap_pages != 0) return false;
+        if (!try_alloc_pool_buffers(pages, false, k_pool, v_pool, k_scales, v_scales)) {
+            (void)hipGetLastError();
+            return false;
+        }
+        cap_pages = pages;
+        ++pool_gen;
+        return true;
+    }
+
     bool ensure_page(int slot, int logical_page, hipStream_t st, std::string& err) {
         if (logical_page < 0 || logical_page >= max_pages_per_slot) {
             err = "KV logical page out of range (" + std::to_string(logical_page) + " >= " + std::to_string(max_pages_per_slot) + ")";
@@ -448,6 +460,7 @@ struct GpuSlotMeta {
     GpuBuffer dspark_frnn;
     int dspark_cap = 0;
     int dspark_len = 0;
+    int dspark_history_begin = 0;
     // Adaptive EMA DSpark acceptance tracker (zero regression on low-accept chat prompts!)
     float dspark_ema_acc = 0.50f;
     int dspark_last_draft = 0;
@@ -474,6 +487,7 @@ struct GpuSlotMeta {
         }
         free_gpu_buffer(dspark_frnn);
         dspark_cap = dspark_len = 0;
+        dspark_history_begin = 0;
         dspark_ema_acc = 0.50f;
         dspark_last_draft = 0;
         dspark_last_anchor = -1;
@@ -1416,6 +1430,24 @@ public:
                 }
             }
         }
+        const char* ds_window = std::getenv("STRATA_INKLING_HIP_DSPARK_WINDOW");
+        dspark_global_window_ = ds_window ? std::max(0, std::atoi(ds_window)) : 0;
+        dspark_ring_mask_ = -1;
+        const char* ds_compact = std::getenv("STRATA_INKLING_HIP_DSPARK_COMPACT");
+        if (has_dspark_ && max_slots_ == 1 && ds_compact && std::strcmp(ds_compact, "1") == 0 &&
+            dspark_global_window_ > 0 && dspark_cfg_.swa_win > 0) {
+            dspark_history_window_ = std::max(dspark_cfg_.swa_win, dspark_global_window_);
+            const int64_t needed = static_cast<int64_t>(dspark_history_window_) + guard_.max_prefill_chunk + kTreeMaxM;
+            // Leave space for a full incoming chunk and every speculative rollback.
+            if (needed < max_ctx_) {
+                const uint32_t cap = std::bit_ceil(static_cast<uint32_t>(needed));
+                if (cap < static_cast<uint32_t>(max_ctx_)) {
+                    dspark_ring_mask_ = static_cast<int>(cap - 1);
+                    std::fprintf(stderr, "[ink-hip] DSpark rolling context: %u rows (window=%d)\n",
+                                 cap, dspark_history_window_);
+                }
+            }
+        }
         const bool is_fp8 = (default_kv_dtype_ == KvDtype::FP8_E4M3);
 
         swa_pools_.resize(c_.n_swa_visits);
@@ -1426,6 +1458,8 @@ public:
         const char* kv_growth = std::getenv("STRATA_INKLING_HIP_FAST_KV_GROW");
         const bool small_growth = use_fp8_prefill_ && is_fp8 && max_slots_ == 1 &&
                                   kv_growth && std::strcmp(kv_growth, "1") == 0;
+        const char* kv_reserve = std::getenv("STRATA_INKLING_HIP_PREFILL_KV_RESERVE");
+        reserve_prefill_kv_ = small_growth && !mem_info_.is_uma && kv_reserve && std::strcmp(kv_reserve, "1") == 0;
         for (auto& pool : glob_pools_) {
             if (!pool.init(false, is_fp8, mem_info_.is_uma, max_slots_, max_glob_pages, kv_dim, err)) return false;
             pool.allow_small_geometric_growth = small_growth;
@@ -1472,6 +1506,7 @@ public:
         auto& sl = slots_[slot];
         sl.seq_len = 0;
         sl.dspark_len = 0;
+        sl.dspark_history_begin = 0;
         sl.has_snap = false;
         sl.dspark_ema_acc = 0.50f;
         sl.dspark_last_draft = 0;
@@ -1574,6 +1609,7 @@ public:
                 const int sub_n = std::min(chunk_cap, B_tot - off);
                 StepBatch sub;
                 sub.n_tokens = sub_n;
+                if (off == 0) sub.initial_prompt_tokens = batch.initial_prompt_tokens;
                 sub.slot_ids.assign(batch.slot_ids.begin() + off, batch.slot_ids.begin() + off + sub_n);
                 sub.pos.assign(batch.pos.begin() + off, batch.pos.begin() + off + sub_n);
                 sub.token_ids.assign(batch.token_ids.begin() + off, batch.token_ids.begin() + off + sub_n);
@@ -1605,7 +1641,7 @@ public:
             return 0;
         }
         auto& sl = slots_[slot];
-        if (anchor_pos < 1 || sl.dspark_len < anchor_pos) return 0;
+        if (!dspark_has_history(sl, anchor_pos)) return 0;
 
         const int B = dspark_cfg_.block_size;  // 8
         // Adaptive EMA DSpark length control: full K=7 on math/code, graceful backoff K=4->2->0 on low-accept chat!
@@ -1713,18 +1749,11 @@ public:
                 k_half_rope<<<dim3(KV, B), hd / 2, 0, stream_>>>(kd, nullptr, anchor_pos, B, KV, hd, dspark_cfg_.rope_theta);
             }
 
-            // Opt-in: STRATA_INKLING_HIP_DSPARK_WINDOW=N caps the drafter's *global* layers to the last N
-            // positions. Its sliding layers keep the window the model asks for, so this can only remove work;
-            // 0 (the default) leaves the drafter exactly as configured, so the default path is unchanged.
-            static const int ds_swa_env = [] {
-                const char* e = std::getenv("STRATA_INKLING_HIP_DSPARK_WINDOW");
-                return e ? std::atoi(e) : 0;
-            }();
-            const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : (ds_swa_env > 0 ? ds_swa_env : 0);
+            const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : dspark_global_window_;
             k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B), 128, 0, stream_>>>(
                 q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                 reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
-                kd, vd, d_toks, ao, B, H, KV, swa_w);
+                kd, vd, d_toks, ao, B, H, KV, swa_w, dspark_ring_mask_);
 
             launch_bf16_opt(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B, D, q_dim);
             k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B * D);
@@ -1746,7 +1775,7 @@ public:
         k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B, D, dspark_cfg_.rms_eps);
         k_dspark_load_frnn_zero<<<(std::max(D, rank) + 255) / 256, 256, 0, stream_>>>(
             reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr), d_toks,
-            res, reinterpret_cast<float*>(d_dspark_state_.dev_ptr), D, rank);
+            res, reinterpret_cast<float*>(d_dspark_state_.dev_ptr), D, rank, dspark_ring_mask_);
         if (ds_prof) (void)hipEventRecord(devt[1], stream_);
 
         const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
@@ -1849,7 +1878,7 @@ public:
         if (!has_dspark_ || max_emit <= 0 || out_emitted == nullptr) return 0;
         if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return 0;
         auto& sl = slots_[slot];
-        if (anchor_pos < 1 || sl.dspark_len < anchor_pos || anchor_pos + kTreeMaxM >= sl.max_ctx) return 0;
+        if (!dspark_has_history(sl, anchor_pos) || anchor_pos + kTreeMaxM >= sl.max_ctx) return 0;
         if (c_.head_dim > 128 || c_.d_rel > 16 || (c_.rel_extent & 3) != 0) return 0;
         if (static_cast<int>(dspark_qkv_.size()) != dspark_cfg_.n_layers ||
             dspark_qkv_[0].dev_ptr == nullptr || dspark_gu_[0].dev_ptr == nullptr) return 0;
@@ -1976,15 +2005,11 @@ public:
                     k_dspark_split_qkv_norm_rope<<<dim3(H + 2 * KV, B_ds), 128, 0, stream_>>>(
                         qkv_cat, ds_f32(p + ".self_attn.q_norm.weight"), ds_f32(p + ".self_attn.k_norm.weight"),
                         d_hdr, q, kd, vd, B_ds, H, KV, hd, dspark_cfg_.rms_eps, dspark_cfg_.rope_theta);
-                    static const int ds_swa_env = [] {
-                        const char* e = std::getenv("STRATA_INKLING_HIP_DSPARK_WINDOW");
-                        return e ? std::atoi(e) : 0;
-                    }();
-                    const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : (ds_swa_env > 0 ? ds_swa_env : 0);
+                    const int swa_w = dspark_cfg_.is_swa[il] ? dspark_cfg_.swa_win : dspark_global_window_;
                     k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B_ds), 128, 0, stream_>>>(
                         q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                         reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
-                        kd, vd, d_hdr, ao, B_ds, H, KV, swa_w);
+                        kd, vd, d_hdr, ao, B_ds, H, KV, swa_w, dspark_ring_mask_);
                     launch_bf16_opt(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B_ds, D, q_dim);
                     k_vec_add<<<(B_ds * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B_ds * D);
 
@@ -1998,7 +2023,7 @@ public:
                 k_rms_norm_rows<<<B_ds, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B_ds, D, dspark_cfg_.rms_eps);
                 k_dspark_load_frnn_zero<<<(std::max(D, rank) + 255) / 256, 256, 0, stream_>>>(
                     reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr), d_hdr,
-                    res, reinterpret_cast<float*>(d_beam_st_a_.dev_ptr), D, rank);
+                    res, reinterpret_cast<float*>(d_beam_st_a_.dev_ptr), D, rank, dspark_ring_mask_);
 
                 const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
                 const int V = c_.vocab_unpadded;
@@ -2334,7 +2359,8 @@ public:
         }
 
         sl.seq_len = anchor_pos + n_acc;
-        sl.dspark_len = anchor_pos + n_acc;
+        sl.dspark_len = std::min(sl.dspark_len, anchor_pos);
+        for (int pos = anchor_pos; pos < anchor_pos + n_acc; ++pos) record_dspark_context(sl, pos);
         sl.has_snap = true;
         sl.snap_seq_len = anchor_pos;
         sl.sconv_rec_n = n_acc;
@@ -3030,8 +3056,9 @@ private:
             !re(sc_sinks_, static_cast<size_t>(B) * c_.n_head * 4) || !re(sc_gate_a_, static_cast<size_t>(B) * q_dim * 4) ||
             !re(sc_k_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) || !re(sc_v_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) ||
             !re(sc_attn_out_, static_cast<size_t>(B) * q_dim * 4) ||
+            // Split-KV scratch is only used by decode batches of at most four rows.
             !re(sc_splitkv_part_, static_cast<size_t>(c_.n_head) * sizeof(float) *
-                                  std::max(std::max(B, 4) * 4 * 130,
+                                  std::max(4 * 4 * 130,
                                            use_fp8_gqa_decode_ ? kGlobalGqaSplits * kGlobalGqaStride : 0)) ||
             !re(sc_o_proj_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_a_sconv_, static_cast<size_t>(B) * D * 4) || !re(sc_mlp_in_, static_cast<size_t>(B) * D * 4) ||
@@ -3081,9 +3108,29 @@ private:
                al(ds_gu_, static_cast<size_t>(B) * 2 * inter * 4);
     }
 
+    bool dspark_has_history(const GpuSlotMeta& sl, int anchor) const {
+        if (anchor < 1 || sl.dspark_len < anchor) return false;
+        if (dspark_ring_mask_ < 0) return true;
+        // The recurrent state also needs the anchor's predecessor, even for a one-token window.
+        const int first_required = std::min(anchor - 1, std::max(0, anchor - dspark_history_window_ + 1));
+        return first_required >= sl.dspark_history_begin;
+    }
+
+    void record_dspark_context(GpuSlotMeta& sl, int pos) const {
+        if (dspark_ring_mask_ >= 0) {
+            // A gap or rollback beyond retained history starts a new contiguous span.
+            if (pos > sl.dspark_len || sl.dspark_len <= sl.dspark_history_begin) {
+                sl.dspark_history_begin = pos;
+            }
+            sl.dspark_history_begin = std::max(sl.dspark_history_begin, pos - dspark_ring_mask_);
+        }
+        sl.dspark_len = std::max(sl.dspark_len, pos + 1);
+    }
+
     bool ensure_dspark_slot_cap(GpuSlotMeta& sl, int need_len, std::string& err) {
+        const int max_cap = dspark_ring_mask_ >= 0 ? dspark_ring_mask_ + 1 : std::max(need_len, max_ctx_ + 16);
+        need_len = std::min(need_len, max_cap);
         if (need_len <= sl.dspark_cap) return true;
-        const int max_cap = std::max(need_len, max_ctx_ + 16);
         const int new_cap = std::min(max_cap, std::max(need_len, std::max(256, sl.dspark_cap * 2)));
         const int kv_dim = dspark_cfg_.n_kv * dspark_cfg_.head_dim;
         const int D = dspark_cfg_.hidden;
@@ -3220,6 +3267,24 @@ private:
             (void)hipMemcpyAsync(sc_grp_slot_.dev_ptr, h_grp_slot.data(), h_grp_slot.size() * 4, hipMemcpyHostToDevice, stream_);
             (void)hipMemcpyAsync(sc_grp_off_.dev_ptr, h_grp_off.data(), h_grp_off.size() * 4, hipMemcpyHostToDevice, stream_);
             (void)hipMemcpyAsync(sc_grp_tok_.dev_ptr, h_grp_tok.data(), h_grp_tok.size() * 4, hipMemcpyHostToDevice, stream_);
+        }
+
+        if (reserve_prefill_kv_ && batch.initial_prompt_tokens >= 8192 && !glob_pools_.empty()) {
+            const int prompt = std::min(batch.initial_prompt_tokens, max_ctx_);
+            // Leave space for the first decode steps at a page boundary.
+            const int tokens = prompt + std::min(256, max_ctx_ - prompt);
+            const int pages = 1 + (tokens - 1) / kKvPageTokens;
+            const size_t page_bytes = static_cast<size_t>(kKvPageTokens) * 2 * (kv_dim + sizeof(float));
+            const size_t bytes = glob_pools_.size() * pages * page_bytes;
+            size_t free = 0, total = 0;
+            // Keep room for the remaining SWA pages and speculative decoding scratch.
+            if (hipMemGetInfo(&free, &total) == hipSuccess && free > bytes && free - bytes >= (768ULL << 20)) {
+                int reserved = 0;
+                for (auto& pool : glob_pools_) reserved += pool.reserve_empty(pages);
+                if (reserved > 0)
+                    std::fprintf(stderr, "[ink-hip] Reserved %d global KV pools with %d pages each for prefill\n",
+                                 reserved, pages);
+            }
         }
 
         // Pre-ensure KV pages exist for all tokens in batch across all 40 SWA & 8 Global pools
@@ -3374,7 +3439,7 @@ private:
                 for (int b = 0; b < B; ++b) {
                     auto& sl = slots_[batch.slot_ids[b]];
                     sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
-                    if (do_dspark_ctx) sl.dspark_len = std::max(sl.dspark_len, batch.pos[b] + 1);
+                    if (do_dspark_ctx) record_dspark_context(sl, batch.pos[b]);
                 }
                 if (!hip_ok(hipMemcpyAsync(logits_out, sc_logits_.dev_ptr, lbytes, hipMemcpyDeviceToHost, stream_),
                             "logits D2H", err)) return false;
@@ -4638,7 +4703,7 @@ private:
             for (int b = 0; b < B; ++b) {
                 auto& sl = slots_[batch.slot_ids[b]];
                 sl.seq_len = std::max(sl.seq_len, batch.pos[b] + 1);
-                if (do_dspark_ctx) sl.dspark_len = std::max(sl.dspark_len, batch.pos[b] + 1);
+                if (do_dspark_ctx) record_dspark_context(sl, batch.pos[b]);
             }
             const size_t lbytes = static_cast<size_t>(B) * V * sizeof(float);
             if (!hip_ok(hipMemcpyAsync(logits_out, sc_logits_.dev_ptr, lbytes, hipMemcpyDeviceToHost, stream_),
@@ -4655,7 +4720,7 @@ private:
             launch_dspark_ctx_kernels(B);
             for (int b = 0; b < B; ++b) {
                 auto& sl = slots_[batch.slot_ids[b]];
-                sl.dspark_len = std::max(sl.dspark_len, batch.pos[b] + 1);
+                record_dspark_context(sl, batch.pos[b]);
             }
         }
         if (taps_out) {
@@ -4769,16 +4834,16 @@ private:
             k_rms_norm_rows<<<B * KV, 256, 0, stream_>>>(kc, ds_f32(p + ".self_attn.k_norm_ctx.weight"), kc, B * KV, hd, dspark_cfg_.rms_eps);
             k_half_rope<<<dim3(KV, B), hd / 2, 0, stream_>>>(kc, pos_d, 0, B, KV, hd, dspark_cfg_.rope_theta);
             k_dspark_ctx_scatter<<<dim3((kv_dim + 255) / 256, B), 256, 0, stream_>>>(
-                kc, reinterpret_cast<uint16_t* const*>(d_ds_k_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim);
+                kc, reinterpret_cast<uint16_t* const*>(d_ds_k_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim, dspark_ring_mask_);
             k_dspark_ctx_scatter<<<dim3((kv_dim + 255) / 256, B), 256, 0, stream_>>>(
-                vc, reinterpret_cast<uint16_t* const*>(d_ds_v_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim);
+                vc, reinterpret_cast<uint16_t* const*>(d_ds_v_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim, dspark_ring_mask_);
         }
         float w_rnn[4];
         softmax4(dspark_cfg_.n_layers, w_rnn);
         k_dspark_fuse_mix<<<B, 256, 0, stream_>>>(t0, t1, t2, t3, w_rnn[0], w_rnn[1], w_rnn[2], w_rnn[3],
                                                   ds_f32("markov_head.dflare_norm.weight"), ctx, B, D, dspark_cfg_.rms_eps);
         k_dspark_ctx_scatter<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
-            ctx, reinterpret_cast<uint16_t* const*>(d_ds_frnn_ptrs_.dev_ptr), sids_d, pos_d, B, D);
+            ctx, reinterpret_cast<uint16_t* const*>(d_ds_frnn_ptrs_.dev_ptr), sids_d, pos_d, B, D, dspark_ring_mask_);
     }
 
     bool ensure_tree_scratch(std::string& err) {
@@ -5548,6 +5613,9 @@ private:
     BackendOpts opts_;
     InkCfg c_;
     DsparkCfg dspark_cfg_;
+    int dspark_global_window_ = 0;
+    int dspark_ring_mask_ = -1;
+    int dspark_history_window_ = 0;
     DeviceMemoryInfo mem_info_;
     DeviceMemoryInfo peer_mem_info_;
     DispatchGuard guard_;
@@ -5583,6 +5651,7 @@ private:
     bool use_q8_vector_decode_ = false;
     bool use_fp8_gqa_decode_ = false;
     bool use_fp8_prefill_ = false;
+    bool reserve_prefill_kv_ = false;
     KvDtype default_kv_dtype_ = KvDtype::FP16;
     bool has_dspark_ = false;
     int max_slots_ = 1;

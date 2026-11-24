@@ -12,9 +12,11 @@ $env:STRATA_INKLING_HIP_Q8_PROJECTIONS = '1'
 $env:STRATA_INKLING_HIP_Q8_VECTOR_DECODE = '1'
 $env:STRATA_INKLING_HIP_FP8_GQA_DECODE = '1'
 $env:STRATA_INKLING_HIP_DSPARK_WINDOW = '1024'
+$env:STRATA_INKLING_HIP_DSPARK_COMPACT = '1'
 $env:STRATA_INKLING_HIP_TREE_FP8 = '1'
 $env:STRATA_INKLING_HIP_FP8_PREFILL = '1'
 $env:STRATA_INKLING_HIP_FAST_KV_GROW = '1'
+$env:STRATA_INKLING_HIP_PREFILL_KV_RESERVE = '1'
 $env:STRATA_INKLING_HIP_MOE_SF4_LUT = '1'
 
 .\build-hip\src\inkling2\strata-inkling.exe --serve --native 'D:\models\Inkling-2-Mini-SQ-15.strata' --max-context 32768 --kv fp8 --draft on
@@ -22,12 +24,17 @@ $env:STRATA_INKLING_HIP_MOE_SF4_LUT = '1'
 
 `--kv fp8` selects the cache format used by the FP8 attention paths. `--draft on`
 enables DSpark, and the 1,024-token window limits the drafter's global attention.
-The target model still verifies against its full configured context.
+`STRATA_INKLING_HIP_DSPARK_COMPACT` stores recent drafter history in a rolling
+buffer when serving a single slot with a capped window. The target model still
+verifies against its full configured context.
 `STRATA_INKLING_HIP_FP8_PREFILL` uses native FP8 conversion while reading prompts
-on RDNA4. With it enabled, `STRATA_INKLING_HIP_FAST_KV_GROW` lets the engine grow
-small global KV caches in larger steps for a single request when there is enough
-VRAM. `STRATA_INKLING_HIP_MOE_SF4_LUT` reuses decoded SF4 weight values in the
-mixed-expert prefill kernels. `--serve` starts the engine's standard input/output protocol.
+on RDNA4. `STRATA_INKLING_HIP_FAST_KV_GROW` lets small global KV caches grow in
+larger steps. With both FP8 prefill and fast growth enabled,
+`STRATA_INKLING_HIP_PREFILL_KV_RESERVE` reserves space in empty global KV pools
+at the start of a single-slot prompt of at least 8,192 tokens on a discrete GPU
+when enough free VRAM is available. `STRATA_INKLING_HIP_MOE_SF4_LUT` reuses
+decoded SF4 weight values in the mixed-expert prefill kernels. `--serve` starts
+the engine's standard input/output protocol.
 See [AMD HIP build instructions](AMD_HIP.md).
 
 ### RX 9060 XT benchmark
@@ -65,6 +72,32 @@ prefill from 43.50 s to 41.28 s. Prefill plus 128 generated tokens took 47.31 s
 with the lookup off and 45.21 s with it on. Each setting ran twice with graph
 replay enabled, in baseline/new/new/baseline order. All four runs emitted the
 same greedy tokens.
+
+### Rolling drafter history on Windows
+
+On the RX 9060 XT, the rolling buffer held 2,048 rows, including space for a
+whole prefill chunk and speculative rollback. At 32K, it used about 495 MiB
+less allocated drafter storage than the full history.
+
+In a four-run comparison with normal graph replay, median time to read 32K
+tokens and generate 128 fell from 40.88 s to 38.09 s. Median peak process
+shared GPU memory during prefill fell from 3.93 GiB to 2.58 GiB in the Windows
+counters. The two timings per setting overlapped. All four runs produced the
+same greedy tokens. A separate check matched output after the buffer wrapped,
+after a follow-up reused the cached prefix, and after a request reset the slot.
+
+### Faster long prompts on Windows
+
+With the earlier settings already enabled, reserving global KV space up
+front reduced median prefill time from **35.80 s to 34.01 s (5.0%)**.
+Median time to read 32,768 tokens and generate 128 fell from **38.44 s to
+36.97 s (3.8%)**. Decode alone took 2.92 s and 2.89 s.
+
+This comparison used Inkling-2-Mini SQ-15 on the Windows RX 9060 XT (16 GB),
+with four fresh baseline runs and three with reservation enabled. Both
+settings used FP8 KV, HIP graph replay, and the same rolling DSpark
+history. All seven runs generated the same 128 greedy tokens. The timing
+ranges overlapped.
 
 ## RX 7900 XTX support and performance evidence
 
